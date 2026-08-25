@@ -489,10 +489,12 @@ namespace
 
                 for (size_t i = 0; i < n; ++i)
                 {
-                    if (cs_insn_group(session.handle, &insn[i], CS_GRP_CALL))
-                    {
 #if defined(__aarch64__)
-                        if (session.is64 && insn[i].detail && insn[i].detail->arm64.op_count > 0)
+                    if (session.is64)
+                    {
+                        const char *mn = insn[i].mnemonic;
+                        if ((std::strcmp(mn, "bl") == 0 || std::strcmp(mn, "blr") == 0) && insn[i].detail &&
+                            insn[i].detail->arm64.op_count > 0)
                         {
                             const cs_arm64_op &op = insn[i].detail->arm64.operands[0];
                             if (op.type == ARM64_OP_IMM)
@@ -502,8 +504,24 @@ namespace
                                     targets.insert(target);
                             }
                         }
-#endif
                     }
+#else
+                    if (!session.is64)
+                    {
+                        const char *mn = insn[i].mnemonic;
+                        if ((std::strcmp(mn, "bl") == 0 || std::strcmp(mn, "blx") == 0) && insn[i].detail &&
+                            insn[i].detail->arm.op_count > 0)
+                        {
+                            const cs_arm_op &op = insn[i].detail->arm.operands[0];
+                            if (op.type == ARM_OP_IMM)
+                            {
+                                const uint64_t target = static_cast<uint64_t>(op.imm);
+                                if (target >= module.base && target < moduleEnd)
+                                    targets.insert(target);
+                            }
+                        }
+                    }
+#endif
                     cursor = insn[i].address + insn[i].size;
                 }
                 cs_free(insn, n);
