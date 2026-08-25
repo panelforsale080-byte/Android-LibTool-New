@@ -439,8 +439,7 @@ namespace
         g_hookedRuntimeAddrs.clear();
     }
 
-
-    static void removeEntryHooks()(const std::string &raw, std::string &err)
+    static std::string resolveAppPath(const std::string &raw, std::string &err)
     {
         const char *candidates[] = {
             "/sdcard/Android/data/com.android.support/files",
