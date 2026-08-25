@@ -43,8 +43,8 @@ jobs:
           APK=$(ls app/build/outputs/apk/debug/*.apk | head -1)
           NAME=$(basename "$APK")
           cp "$APK" "/tmp/${NAME}"
-          gh release delete "v3.3.1" -y 2>/dev/null || true
-          gh release create "v3.3.1" \
-            --title "Android LibTool v3.3.1" \
-            --notes "Phone-optimized menu UI, FPS counter, responsive tabs. Debug APK for authorized testing." \
+          gh release delete "v3.3.2" -y 2>/dev/null || true
+          gh release create "v3.3.2" \
+            --title "Android LibTool v3.3.2" \
+            --notes "IDA-style .lst disassembler (full exec segments), expanded So Monitor hooks (dynsym + in-module BL targets)." \
             "/tmp/${NAME}#${NAME}"
