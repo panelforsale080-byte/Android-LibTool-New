@@ -57,7 +57,7 @@ namespace
     struct SparseSlot
     {
         uint64_t offset = 0;
-        std::atomic<uint64_t> hits{0};
+        uint64_t hits = 0;
         std::string mnemonic;
     };
     std::vector<SparseSlot> g_sparseSlots;
@@ -270,7 +270,7 @@ namespace
             }
             if (lo < g_sparseSlots.size() && g_sparseSlots[lo].offset == offset)
             {
-                g_sparseSlots[lo].hits.fetch_add(1, std::memory_order_relaxed);
+                __atomic_fetch_add(&g_sparseSlots[lo].hits, 1ULL, __ATOMIC_RELAXED);
                 g_totalExecutions.fetch_add(1, std::memory_order_relaxed);
             }
         }
@@ -288,8 +288,8 @@ namespace
 
     static void transformBlock(GumStalkerIterator *iterator, GumStalkerWriter * /*output*/, gpointer /*user_data*/)
     {
-        cs_insn *insn = nullptr;
-        while (gum_stalker_iterator_next(iterator, reinterpret_cast<const cs_insn **>(&insn)))
+        const cs_insn *insn = nullptr;
+        while (gum_stalker_iterator_next(iterator, &insn))
         {
             if (insn && inExecRange(static_cast<uint64_t>(insn->address)))
                 gum_stalker_iterator_put_callout(iterator, onInsnCallout, nullptr, nullptr);
@@ -545,7 +545,7 @@ namespace SoMonitorTrace
             out.reserve(g_sparseSlots.size());
             for (const SparseSlot &slot : g_sparseSlots)
             {
-                const uint64_t hits = slot.hits.load(std::memory_order_relaxed);
+                const uint64_t hits = __atomic_load_n(&const_cast<SparseSlot &>(slot).hits, __ATOMIC_RELAXED);
                 if (hideZeroHits && hits == 0)
                     continue;
                 if (hits < minHits)
@@ -586,7 +586,7 @@ namespace SoMonitorTrace
         else
         {
             for (SparseSlot &slot : g_sparseSlots)
-                slot.hits.store(0, std::memory_order_relaxed);
+                __atomic_store_n(&slot.hits, 0ULL, __ATOMIC_RELAXED);
         }
         g_totalExecutions.store(0, std::memory_order_relaxed);
     }
