@@ -54,6 +54,7 @@ LOCAL_SRC_FILES := \
     Tool/Keyboard.cpp \
     Tool/ProcessTab.cpp \
     Tool/SoMonitor.cpp \
+    Tool/SoMonitorTrace.cpp \
     Tool/Tool.cpp \
     Tool/Util.cpp \
     Tool/Patcher.cpp \

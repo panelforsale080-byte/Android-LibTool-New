@@ -1,8 +1,8 @@
 #include "Tool/SoMonitor.h"
+#include "Tool/SoMonitorTrace.h"
 
 #include "Menu/MenuLayout.h"
 #include "imgui/imgui.h"
-#include "dobby.h"
 // Bundled libfrida-gum.a exports Capstone symbols with a `_frida_` prefix
 // (e.g. T _frida_cs_open) while frida-gum.h declares them bare (cs_open).
 // Redirect at the preprocessor level so the header's prototypes and our
@@ -50,16 +50,6 @@ namespace
         uint64_t base = 0;
         uint64_t size = 0;
         std::vector<ExecRange> execRanges;
-    };
-
-    struct CallLogEntry
-    {
-        uint64_t counter = 0;
-        uint64_t offset = 0;
-        uint64_t runtime = 0;
-        uint64_t args[8] = {};
-        uint64_t lr = 0;
-        uint64_t sp = 0;
     };
 
     struct HookedSymbol
@@ -244,22 +234,7 @@ namespace
         return buffer;
     }
 
-    // ---- monitor state ----
-    std::mutex g_callLogMutex;
-    std::vector<CallLogEntry> g_callLog;
-    size_t g_logCapacity = 400;
-    uint64_t g_counter = 0;
-
-    std::mutex g_stateMutex;
-    bool g_monitoring = false;
-    bool g_hooking = false;
-    uint64_t g_hookedBase = 0;
-    uint64_t g_hookedSize = 0;
-    std::string g_hookedModule;
-    std::vector<HookedSymbol> g_hookedSymbols;
-    std::string g_status;
-
-    thread_local bool t_inCallback = false;
+    // ---- legacy symbol helper (disassembler labels) ----
 
     // ================= IDA-style disassembler (.lst) =================
     struct DisasmLine
@@ -543,40 +518,6 @@ namespace
         }
     }
 
-    static std::vector<HookedSymbol> collectAllHookPoints(const ModuleInfo &module)
-    {
-        std::map<uint64_t, std::string> slots;
-
-        std::vector<HookedSymbol> syms;
-        collectSymbols(module, syms);
-        for (const HookedSymbol &hs : syms)
-            slots[hs.runtime] = hs.name.empty() ? ("sub_" + hex(hs.offset).substr(2)) : hs.name;
-
-        CapstoneSession session;
-        const auto segments = loadExecSegmentsFromFile(module);
-        if (openCapstoneForModule(module, session) && !segments.empty())
-        {
-            enrichSymbolMapWithBranchTargets(module, session, segments, slots);
-            cs_close(&session.handle);
-        }
-        else if (session.handle)
-        {
-            cs_close(&session.handle);
-        }
-
-        std::vector<HookedSymbol> out;
-        out.reserve(slots.size());
-        for (const auto &kv : slots)
-        {
-            HookedSymbol hooked;
-            hooked.runtime = kv.first;
-            hooked.offset = kv.first - module.base;
-            hooked.name = kv.second;
-            out.push_back(std::move(hooked));
-        }
-        return out;
-    }
-
     static bool disassembleExecSegments(const ModuleInfo &module, CapstoneSession &session,
                                         const std::vector<FileExecSegment> &segments,
                                         const std::map<uint64_t, std::string> &symAt, size_t maxLines,
@@ -789,54 +730,6 @@ namespace
     }
 
     // =====================================================================
-    // Runtime API Dumper (sister of the runtime dumper pattern).
-    // Captures every intercepted call into a CSV-like file:
-    //   counter, module, offset, runtime, x0, x1, x2, x3, lr, sp, symbol_name
-    // Written to /sdcard/Android/data/<pkg>/files/<name>.csv (always writable).
-    // =====================================================================
-    bool saveRuntimeDumper(const ModuleInfo &module, const std::string &fileName, std::string &outPath)
-    {
-        std::string err;
-        std::string full = resolveAppPath(fileName, err);
-        if (full.empty()) { outPath = err; return false; }
-
-        FILE *f = fopen(full.c_str(), "w");
-        if (!f) { outPath = "Cannot open " + full; return false; }
-
-        std::fprintf(f, "# Axcel Modified tools - runtime API dumper for %s\n", module.name.c_str());
-        std::fprintf(f, "# base = %s\n", hex(module.base).c_str());
-        std::fprintf(f, "# counter,offset,runtime,symbol,x0,x1,x2,x3,x4,x5,x6,x7,LR,SP\n");
-
-        std::vector<HookedSymbol> syms;
-        collectSymbols(module, syms);
-        std::map<uint64_t, std::string> symAt;
-        for (const HookedSymbol &hs : syms) symAt[hs.runtime] = hs.name;
-
-        size_t written = 0;
-        std::lock_guard<std::mutex> lock(g_callLogMutex);
-        for (const CallLogEntry &entry : g_callLog)
-        {
-            if (entry.runtime < module.base || entry.runtime >= module.base + module.size) continue;
-            auto it = symAt.find(entry.runtime);
-            std::string name = (it != symAt.end()) ? it->second : ("sub_" + hex(entry.offset));
-            std::fprintf(f, "%" PRIu64 ",0x%" PRIX64 ",0x%" PRIX64 ",%s,0x%" PRIX64 ",0x%" PRIX64
-                         ",0x%" PRIX64 ",0x%" PRIX64 ",0x%" PRIX64 ",0x%" PRIX64 ",0x%" PRIX64
-                         ",0x%" PRIX64 ",0x%" PRIX64 ",0x%" PRIX64 "\n",
-                         entry.counter, entry.offset, entry.runtime, name.c_str(),
-                         entry.args[0], entry.args[1], entry.args[2], entry.args[3],
-                         entry.args[4], entry.args[5], entry.args[6], entry.args[7],
-                         entry.lr, entry.sp);
-            ++written;
-        }
-        fclose(f);
-        char absBuf[PATH_MAX] = {};
-        if (realpath(full.c_str(), absBuf)) outPath = absBuf;
-        else outPath = full;
-        outPath += " (" + std::to_string(written) + " captured calls)";
-        return true;
-    }
-
-    // =====================================================================
     // String decryption helpers.
     // Generic passes that often work on obfuscated Android libraries:
     //   1) single-byte XOR (every key 0..0xFF, score printable ratio)
@@ -952,113 +845,22 @@ namespace
     }
     // ============================================================
 
-    void onInstrument(void *address, DobbyRegisterContext *ctx)
+    SoTraceModule toTraceModule(const ModuleInfo &module)
     {
-        // If a hooked function (e.g. memcpy/malloc of libc) is called from inside
-        // this callback, skip logging to avoid infinite recursion.
-        if (t_inCallback)
-            return;
-        t_inCallback = true;
-
-        CallLogEntry entry;
-        entry.runtime = reinterpret_cast<uint64_t>(address);
-        entry.offset = entry.runtime - g_hookedBase;
-        entry.lr = ctx->lr;
-        entry.sp = ctx->sp;
-        for (int i = 0; i < 8; ++i)
-            entry.args[i] = ctx->general.x[i];
-
-        {
-            std::lock_guard<std::mutex> lock(g_callLogMutex);
-            entry.counter = ++g_counter;
-            if (g_callLog.size() >= g_logCapacity)
-                g_callLog.erase(g_callLog.begin());
-            g_callLog.push_back(entry);
-        }
-
-        t_inCallback = false;
+        SoTraceModule out;
+        out.name = module.name;
+        out.path = module.path;
+        out.base = module.base;
+        out.size = module.size;
+        out.execRanges.reserve(module.execRanges.size());
+        for (const ExecRange &range : module.execRanges)
+            out.execRanges.push_back({range.begin, range.end});
+        return out;
     }
 
-    // Requires g_stateMutex to be held.
-    void stopLocked()
+    void startRuntimeTrace(const ModuleInfo &module)
     {
-        if (g_monitoring)
-        {
-            for (const HookedSymbol &sym : g_hookedSymbols)
-                DobbyDestroy(reinterpret_cast<void *>(sym.runtime));
-            g_hookedSymbols.clear();
-            g_monitoring = false;
-        }
-        g_hookedBase = 0;
-        g_hookedSize = 0;
-        g_hookedModule.clear();
-    }
-
-    void startMonitoringThread(const ModuleInfo &module)
-    {
-        std::thread([module]()
-        {
-            // Stop any previous monitor and mark the hooking phase.
-            {
-                std::lock_guard<std::mutex> lock(g_stateMutex);
-                stopLocked();
-                g_hooking = true;
-                g_hookedBase = module.base;
-                g_hookedSize = module.size;
-                g_hookedModule = module.name;
-                g_status = "Reading symbol table of " + module.name + " ...";
-            }
-
-            g_status = "Scanning " + module.name + " (dynsym + BL branch targets) ...";
-            const std::vector<HookedSymbol> symbols = collectAllHookPoints(module);
-
-            {
-                std::lock_guard<std::mutex> lock(g_stateMutex);
-                if (symbols.empty())
-                {
-                    g_hooking = false;
-                    g_hookedBase = 0;
-                    g_hookedSize = 0;
-                    g_hookedModule.clear();
-                    g_status = "No hookable entry points found in " + module.name +
-                               " (no dynsym and no in-module BL targets).";
-                    return;
-                }
-                g_status = "Hooking " + std::to_string(symbols.size()) + " entry points in " + module.name + " ...";
-            }
-
-            dobby_enable_near_branch_trampoline();
-            std::vector<HookedSymbol> hookedSymbols;
-            int failed = 0;
-            for (const HookedSymbol &sym : symbols)
-            {
-                if (DobbyInstrument(reinterpret_cast<void *>(sym.runtime), onInstrument) == 0)
-                    hookedSymbols.push_back(sym);
-                else
-                    ++failed;
-            }
-            dobby_disable_near_branch_trampoline();
-
-            {
-                std::lock_guard<std::mutex> lock(g_stateMutex);
-                g_hooking = false;
-                if (hookedSymbols.empty())
-                {
-                    g_hookedBase = 0;
-                    g_hookedSize = 0;
-                    g_hookedModule.clear();
-                    g_status = "Failed to hook any function of " + module.name + " (Dobby rejected " +
-                               std::to_string(failed) + ").";
-                    return;
-                }
-                g_hookedSymbols = std::move(hookedSymbols);
-                g_monitoring = true;
-                g_counter = 0;
-                g_status = "Monitoring " + module.name + " (" + std::to_string(g_hookedSymbols.size()) +
-                           " entry points, " + std::to_string(failed) +
-                           " skipped). Exported + BL-target calls logged with x0-x7, LR and SP.";
-            }
-        }).detach();
+        SoMonitorTrace::Start(toTraceModule(module));
     }
 } // namespace
 
@@ -1069,38 +871,14 @@ namespace SoMonitor
         if (!g_modulesLoaded)
             refreshModules();
 
-        // Short snapshot of the monitor state; never held while hooking.
-        struct State
-        {
-            bool monitoring = false;
-            bool hooking = false;
-            uint64_t base = 0;
-            uint64_t size = 0;
-            std::string module;
-            std::string status;
-            size_t hookedCount = 0;
-        };
-        State state;
-        {
-            std::lock_guard<std::mutex> lock(g_stateMutex);
-            state.monitoring = g_monitoring;
-            state.hooking = g_hooking;
-            state.base = g_hookedBase;
-            state.size = g_hookedSize;
-            state.module = g_hookedModule;
-            state.status = g_status;
-            state.hookedCount = g_hookedSymbols.size();
-        }
+        const SoTraceState traceState = SoMonitorTrace::GetState();
 
         static int selectedModule = -1;
         static bool requestStart = false;
 
         if (ImGui::Button("Refresh modules##som"))
         {
-            {
-                std::lock_guard<std::mutex> lock(g_stateMutex);
-                if (!g_hooking) stopLocked();
-            }
+            SoMonitorTrace::Stop();
             refreshModules();
             selectedModule = -1;
             requestStart = false;
@@ -1134,7 +912,7 @@ namespace SoMonitor
         }
         ImGui::PopStyleVar(2);
         ImGui::TextDisabled(
-            "Step 1: pick the game lib (only libs under /data/app/ are shown) - hooks dynsym exports + in-module BL targets automatically.");
+            "Step 1: pick the game lib — full runtime instruction trace starts automatically (all threads, Stalker).");
         if (!MenuLayout::IsNarrowLayout())
         {
             const char *preview = "No module selected";
@@ -1159,7 +937,7 @@ namespace SoMonitor
 
         if (selectedModule < 0 || selectedModule >= static_cast<int>(g_modules.size()))
         {
-            ImGui::TextDisabled("Step 1: select the game's main .so above - monitoring starts automatically.");
+            ImGui::TextDisabled("Step 1: select the game's main .so above — runtime trace starts automatically.");
             return;
         }
         const ModuleInfo &module = g_modules[selectedModule];
@@ -1196,134 +974,122 @@ namespace SoMonitor
             uint64_t va, vo;
             if (parseHex(convAddr, va) && parseHex(convOff, vo))
                 ImGui::Text("%s  =  %s + %s", convAddr, hex(module.base).c_str(), convOff);
-
-            // Auto-calc from the intercepted calls: offset = call_address - base of THIS lib
-            {
-                std::lock_guard<std::mutex> lock(g_callLogMutex);
-                if (!g_callLog.empty())
-                {
-                    const CallLogEntry &last = g_callLog.back();
-                    ImGui::TextDisabled("Last intercepted call: 0x%llX", (unsigned long long)last.runtime);
-                    if (ImGui::Button("Offset of last intercepted call##conv", ImVec2(-1, 0)))
-                    {
-                        std::snprintf(convAddr, sizeof(convAddr), "0x%llX", (unsigned long long)last.runtime);
-                        std::snprintf(convOff, sizeof(convOff), "0x%llX",
-                                      (unsigned long long)(last.runtime - module.base));
-                    }
-                }
-            }
         }
         ImGui::Separator();
 
-        // Auto-start: as soon as the user picks a lib (and it is not the one
-        // already being monitored), monitoring of the full lib begins.
-        if (requestStart && !state.hooking)
+        if (requestStart && !traceState.starting)
         {
             requestStart = false;
-            if (!state.monitoring || state.base != module.base || state.module != module.name)
-                startMonitoringThread(module);
+            if (!traceState.active || traceState.base != module.base || traceState.moduleName != module.name)
+                startRuntimeTrace(module);
         }
 
-        if (state.hooking)
+        if (traceState.starting)
         {
-            ImGui::TextColored(ImVec4(1.0f, 0.8f, 0.3f, 1.0f), "%s", state.status.c_str());
+            ImGui::TextColored(ImVec4(1.0f, 0.8f, 0.3f, 1.0f), "%s", traceState.status.c_str());
         }
-        else if (state.monitoring && state.base == module.base && state.module == module.name)
+        else if (traceState.active && traceState.base == module.base && traceState.moduleName == module.name)
         {
-            ImGui::TextColored(ImVec4(0.3f, 1.0f, 0.4f, 1.0f), "%s", state.status.c_str());
-            if (ImGui::Button("Stop monitor", ImVec2(-1, 0)))
-            {
-                std::lock_guard<std::mutex> lock(g_stateMutex);
-                if (!g_hooking)
-                {
-                    stopLocked();
-                    g_status = "Monitor stopped.";
-                }
-            }
+            ImGui::TextColored(ImVec4(0.3f, 1.0f, 0.4f, 1.0f), "%s", traceState.status.c_str());
+            ImGui::TextDisabled("%zu threads | %zu insn slots | %" PRIu64 " total executions", traceState.threadCount,
+                               traceState.insnSlots, traceState.totalExecutions);
+            if (ImGui::Button("Stop runtime trace", ImVec2(-1, 0)))
+                SoMonitorTrace::Stop();
         }
         else
         {
-            ImGui::TextColored(ImVec4(0.3f, 1.0f, 0.4f, 1.0f), "%s", state.status.c_str());
-            if (!state.hooking && ImGui::Button("Monitor full lib", ImVec2(-1, 0)))
-                startMonitoringThread(module);
+            ImGui::TextColored(ImVec4(0.3f, 1.0f, 0.4f, 1.0f), "%s", traceState.status.c_str());
+            if (!traceState.starting && ImGui::Button("Start runtime trace", ImVec2(-1, 0)))
+                startRuntimeTrace(module);
         }
 
-        ImGui::TextDisabled("Tip: avoid libc / libTool itself - the log fills instantly. Pick the game's main lib (e.g. libunity/libil2cpp/libgame).");
+        ImGui::TextDisabled("Heavy: traces every executed instruction in the lib on ALL threads. Stop when done.");
         ImGui::Separator();
 
-        size_t logSize = 0;
-        {
-            std::lock_guard<std::mutex> lock(g_callLogMutex);
-            logSize = g_callLog.size();
-        }
-        if (ImGui::Button("Clear log"))
-        {
-            std::lock_guard<std::mutex> lock(g_callLogMutex);
-            g_callLog.clear();
-        }
-        ImGui::SameLine();
-        if (ImGui::Button("Copy all"))
-        {
-            std::string text;
-            {
-                std::lock_guard<std::mutex> lock(g_callLogMutex);
-                for (const CallLogEntry &entry : g_callLog)
-                {
-                    char line[512] = {};
-                    std::snprintf(line, sizeof(line),
-                                  "[%06" PRIu64 "] %s+0x%" PRIX64 " x0=0x%" PRIX64 " x1=0x%" PRIX64
-                                  " x2=0x%" PRIX64 " x3=0x%" PRIX64 " x4=0x%" PRIX64 " x5=0x%" PRIX64
-                                  " x6=0x%" PRIX64 " x7=0x%" PRIX64 " LR=0x%" PRIX64 " SP=0x%" PRIX64,
-                                  entry.counter, state.module.c_str(), entry.offset, entry.args[0], entry.args[1],
-                                  entry.args[2], entry.args[3], entry.args[4], entry.args[5], entry.args[6],
-                                  entry.args[7], entry.lr, entry.sp);
-                    text += line;
-                    text += "\n";
-                }
-            }
-            ImGui::SetClipboardText(text.c_str());
-        }
-        ImGui::SameLine();
-        ImGui::Text("%zu calls logged", logSize);
+        static bool hideZeroHits = true;
+        static bool sortByHits = true;
+        static int minHits = 1;
+        static char traceFilter[64] = {};
+        static char traceCsvName[128] = {};
+        static std::string traceExportStatus;
 
-        if (ImGui::BeginTable("CallLog", 7,
+        ImGui::Checkbox("Hide 0-hit instructions", &hideZeroHits);
+        ImGui::SameLine();
+        ImGui::Checkbox("Sort by hits", &sortByHits);
+        ImGui::SetNextItemWidth(120.f);
+        ImGui::InputInt("Min hits##trace", &minHits);
+        if (minHits < 0)
+            minHits = 0;
+        ImGui::InputText("Filter offset/mnemonic##trace", traceFilter, sizeof(traceFilter));
+
+        if (ImGui::Button("Clear hit counts"))
+            SoMonitorTrace::ClearHits();
+        ImGui::SameLine();
+        if (traceCsvName[0] == '\0')
+            std::snprintf(traceCsvName, sizeof(traceCsvName), "%s_trace.csv", module.name.c_str());
+        ImGui::SetNextItemWidth(-1);
+        ImGui::InputText("Export CSV##trace", traceCsvName, sizeof(traceCsvName));
+        if (ImGui::Button("Export trace CSV", ImVec2(-1, 0)))
+        {
+            std::string nameCopy = traceCsvName;
+            std::thread([nameCopy]()
+            {
+                std::string outPath;
+                if (SoMonitorTrace::ExportCsv(nameCopy, outPath))
+                    traceExportStatus = "Exported: " + outPath;
+                else
+                    traceExportStatus = "Export failed: " + outPath;
+            }).detach();
+        }
+        if (!traceExportStatus.empty())
+            ImGui::TextWrapped("%s", traceExportStatus.c_str());
+
+        std::vector<SoTraceHitEntry> hits =
+            SoMonitorTrace::GetSnapshot(hideZeroHits, static_cast<uint64_t>(minHits), sortByHits);
+        if (traceFilter[0] != '\0')
+        {
+            std::vector<SoTraceHitEntry> filtered;
+            filtered.reserve(hits.size());
+            for (const SoTraceHitEntry &hit : hits)
+            {
+                char offBuf[32] = {};
+                std::snprintf(offBuf, sizeof(offBuf), "%" PRIX64, hit.offset);
+                if (std::string(offBuf).find(traceFilter) != std::string::npos ||
+                    hit.mnemonic.find(traceFilter) != std::string::npos)
+                    filtered.push_back(hit);
+            }
+            hits = std::move(filtered);
+        }
+
+        ImGui::Text("%zu instruction rows shown", hits.size());
+
+        if (ImGui::BeginTable("TraceHits", 3,
                               ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY,
                               ImVec2(0, MenuLayout::ScrollPanelHeight(0.30f, 150.f))))
         {
-            ImGui::TableSetupColumn("#", ImGuiTableColumnFlags_WidthFixed, 44.0f);
-            ImGui::TableSetupColumn("Offset", ImGuiTableColumnFlags_WidthFixed, 88.0f);
-            ImGui::TableSetupColumn("x0", ImGuiTableColumnFlags_WidthFixed, 76.0f);
-            ImGui::TableSetupColumn("x1", ImGuiTableColumnFlags_WidthFixed, 76.0f);
-            ImGui::TableSetupColumn("x2", ImGuiTableColumnFlags_WidthFixed, 76.0f);
-            ImGui::TableSetupColumn("x3", ImGuiTableColumnFlags_WidthFixed, 76.0f);
-            ImGui::TableSetupColumn("LR", ImGuiTableColumnFlags_WidthStretch);
+            ImGui::TableSetupColumn("Offset", ImGuiTableColumnFlags_WidthFixed, 110.0f);
+            ImGui::TableSetupColumn("Instruction", ImGuiTableColumnFlags_WidthStretch);
+            ImGui::TableSetupColumn("Hits", ImGuiTableColumnFlags_WidthFixed, 80.0f);
             ImGui::TableHeadersRow();
 
-            std::lock_guard<std::mutex> lock(g_callLogMutex);
-            for (size_t index = 0; index < g_callLog.size(); ++index)
+            const size_t cap = hits.size() < 2000 ? hits.size() : 2000;
+            for (size_t index = 0; index < cap; ++index)
             {
-                const CallLogEntry &entry = g_callLog[index];
+                const SoTraceHitEntry &hit = hits[index];
                 ImGui::PushID(static_cast<int>(index));
                 ImGui::TableNextRow();
                 ImGui::TableSetColumnIndex(0);
-                ImGui::Text("%" PRIu64, entry.counter);
+                ImGui::Text("+0x%08" PRIX64, hit.offset);
                 ImGui::TableSetColumnIndex(1);
-                ImGui::Text("+0x%" PRIX64, entry.offset);
+                ImGui::TextUnformatted(hit.mnemonic.c_str());
                 ImGui::TableSetColumnIndex(2);
-                ImGui::Text("0x%" PRIX64, entry.args[0]);
-                ImGui::TableSetColumnIndex(3);
-                ImGui::Text("0x%" PRIX64, entry.args[1]);
-                ImGui::TableSetColumnIndex(4);
-                ImGui::Text("0x%" PRIX64, entry.args[2]);
-                ImGui::TableSetColumnIndex(5);
-                ImGui::Text("0x%" PRIX64, entry.args[3]);
-                ImGui::TableSetColumnIndex(6);
-                ImGui::Text("0x%" PRIX64, entry.lr);
+                ImGui::Text("%" PRIu64, hit.hits);
                 ImGui::PopID();
             }
             ImGui::EndTable();
         }
-        ImGui::TextDisabled("x4-x7 and SP are also captured; use Copy all for the full argument list.");
+        if (hits.size() > 2000)
+            ImGui::TextDisabled("UI capped at 2000 rows — export CSV for full list.");
 
         // ---------- IDA-style disassembler ----------
         ImGui::Separator();
@@ -1370,27 +1136,6 @@ namespace SoMonitor
                         g_disasmBusy = false;
                     }).detach();
                 }
-
-                // ------- Runtime API dumper (sister of the runtime dumper) -------
-                static char dumpName[128] = {};
-                static std::string dumpStatus;
-                if (dumpName[0] == '\0')
-                    std::snprintf(dumpName, sizeof(dumpName), "%s_runtime.csv", module.name.c_str());
-                ImGui::InputText("Dumper file (csv)##som", dumpName, sizeof(dumpName));
-                if (ImGui::Button("Dump runtime API calls", ImVec2(-1, 0)))
-                {
-                    std::string nameCopy = dumpName;
-                    std::thread([module, nameCopy]()
-                    {
-                        std::string outPath;
-                        if (saveRuntimeDumper(module, nameCopy, outPath))
-                            dumpStatus = "Dumped: " + outPath;
-                        else
-                            dumpStatus = "Dump failed: " + outPath;
-                    }).detach();
-                }
-                if (!dumpStatus.empty())
-                    ImGui::TextWrapped("%s", dumpStatus.c_str());
 
                 // ------- String decryption -------
                 if (ImGui::Button("Decrypt strings in lib", ImVec2(-1, 0)))

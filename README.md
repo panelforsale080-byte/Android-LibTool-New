@@ -2,15 +2,22 @@
 
 Native Android mod menu for **authorized** IL2CPP / Unity testing on apps and devices you own or have permission to inspect.
 
-**Version:** 3.3.2
+**Version:** 3.4.0
 
 ## Download APK (public)
 
-**Direct link:** https://github.com/panelforsale080-byte/Android-LibTool-New/releases/download/v3.3.2/app-debug.apk
+**Direct link:** https://github.com/panelforsale080-byte/Android-LibTool-New/releases/download/v3.4.0/app-debug.apk
 
-**Release page:** https://github.com/panelforsale080-byte/Android-LibTool-New/releases/tag/v3.3.2
+**Release page:** https://github.com/panelforsale080-byte/Android-LibTool-New/releases/tag/v3.4.0
 
 > arm64-v8a debug APK (modern 64-bit phones). Delete the GitHub repo/release when you no longer need it.
+
+## What's new in v3.4.0
+
+- **Full runtime instruction trace** — Frida Stalker counts every executed instruction in the selected `.so` (all threads)
+- **Per-offset hit table** — e.g. `+0x123455 sub sp, sp, #0x80 → 80 hits`
+- **Export trace CSV** — `offset,mnemonic,hits` to app files folder
+- Replaces the old Dobby entry-point call log
 
 ## What's new in v3.3.2
 

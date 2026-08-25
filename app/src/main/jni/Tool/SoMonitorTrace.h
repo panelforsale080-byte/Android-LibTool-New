@@ -1,0 +1,49 @@
+#pragma once
+
+#include <cstdint>
+#include <string>
+#include <vector>
+
+struct SoTraceExecRange
+{
+    uint64_t begin = 0;
+    uint64_t end = 0;
+};
+
+struct SoTraceModule
+{
+    std::string name;
+    std::string path;
+    uint64_t base = 0;
+    uint64_t size = 0;
+    std::vector<SoTraceExecRange> execRanges;
+};
+
+struct SoTraceHitEntry
+{
+    uint64_t offset = 0;
+    std::string mnemonic;
+    uint64_t hits = 0;
+};
+
+struct SoTraceState
+{
+    bool active = false;
+    bool starting = false;
+    std::string status;
+    std::string moduleName;
+    uint64_t base = 0;
+    size_t threadCount = 0;
+    size_t insnSlots = 0;
+    uint64_t totalExecutions = 0;
+};
+
+namespace SoMonitorTrace
+{
+    void Start(const SoTraceModule &module);
+    void Stop();
+    SoTraceState GetState();
+    std::vector<SoTraceHitEntry> GetSnapshot(bool hideZeroHits, uint64_t minHits, bool sortByHitsDesc);
+    void ClearHits();
+    bool ExportCsv(const std::string &fileName, std::string &outPath);
+}
