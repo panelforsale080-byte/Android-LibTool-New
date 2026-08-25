@@ -434,7 +434,7 @@ namespace ProcessTab
         {
             if (ImGui::BeginTable("SharedLibraryMappings", 5,
                                   ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY,
-                                  ImVec2(0, MenuLayout::ScrollPanelHeight(0.42f, 150.f)))
+                                  ImVec2(0, MenuLayout::ScrollPanelHeight(0.42f, 150.f))))
             {
                 ImGui::TableSetupColumn("Library", ImGuiTableColumnFlags_WidthStretch);
                 ImGui::TableSetupColumn("Start", ImGuiTableColumnFlags_WidthFixed,
