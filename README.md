@@ -2,15 +2,20 @@
 
 Native Android mod menu for **authorized** IL2CPP / Unity testing on apps and devices you own or have permission to inspect.
 
-**Version:** 3.4.1
+**Version:** 3.4.2
 
 ## Download APK (public)
 
-**Direct link:** https://github.com/panelforsale080-byte/Android-LibTool-New/releases/download/v3.4.1/app-debug.apk
+**Direct link:** https://github.com/panelforsale080-byte/Android-LibTool-New/releases/download/v3.4.2/app-debug.apk
 
-**Release page:** https://github.com/panelforsale080-byte/Android-LibTool-New/releases/tag/v3.4.1
+**Release page:** https://github.com/panelforsale080-byte/Android-LibTool-New/releases/tag/v3.4.2
 
 > arm64-v8a debug APK (modern 64-bit phones). Delete the GitHub repo/release when you no longer need it.
+
+## What's new in v3.4.2
+
+- **Reliable runtime trace** — replaced non-working Stalker with **PC sampler** (polls all thread PCs ~2kHz) + **Dobby entry hooks** (exports + BL targets)
+- Hit counts now update when game code actually runs in the selected lib
 
 ## What's new in v3.4.1
 

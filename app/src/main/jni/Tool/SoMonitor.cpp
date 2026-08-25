@@ -921,7 +921,7 @@ namespace SoMonitor
         }
         ImGui::PopStyleVar(2);
         ImGui::TextDisabled(
-            "Step 1: pick the game lib — full runtime instruction trace starts automatically (all threads, Stalker).");
+            "Step 1: pick the game lib — PC sampler + entry hooks trace (works without Stalker).");
         if (!MenuLayout::IsNarrowLayout())
         {
             const char *preview = "No module selected";
@@ -1000,12 +1000,15 @@ namespace SoMonitor
         else if (traceState.active && traceState.base == module.base && traceState.moduleName == module.name)
         {
             ImGui::TextColored(ImVec4(0.3f, 1.0f, 0.4f, 1.0f), "%s", traceState.status.c_str());
-            ImGui::TextDisabled("%zu threads | %zu insn slots | %" PRIu64 " hits | %" PRIu64 " callouts",
-                               traceState.threadCount, traceState.insnSlots, traceState.totalExecutions,
-                               traceState.calloutFires);
-            if (traceState.calloutFires == 0)
+            ImGui::TextDisabled("%zu threads | %zu hooks | %zu slots | %" PRIu64 " hits | sample:%" PRIu64 " hook:%" PRIu64 " rounds:%" PRIu64,
+                               traceState.threadCount, traceState.hookedCount, traceState.insnSlots,
+                               traceState.totalExecutions, traceState.sampleHits, traceState.hookHits,
+                               traceState.sampleRounds);
+            if (traceState.totalExecutions == 0 && traceState.sampleRounds > 50)
                 ImGui::TextColored(ImVec4(1.0f, 0.5f, 0.3f, 1.0f),
-                                   "No callouts yet — interact with the game (callouts=0 means Stalker not firing).");
+                                   "Sampler running but 0 hits — make sure game code in this lib is executing.");
+            else if (traceState.sampleRounds == 0)
+                ImGui::TextColored(ImVec4(1.0f, 0.5f, 0.3f, 1.0f), "Starting sampler ...");
             if (ImGui::Button("Stop runtime trace", ImVec2(-1, 0)))
                 SoMonitorTrace::Stop();
         }
@@ -1016,7 +1019,7 @@ namespace SoMonitor
                 startRuntimeTrace(module);
         }
 
-        ImGui::TextDisabled("Heavy: traces every executed instruction in the lib on ALL threads. Stop when done.");
+        ImGui::TextDisabled("PC sampler polls all threads ~2kHz + Dobby hooks on exports/BL targets.");
         ImGui::Separator();
 
         static bool hideZeroHits = true;

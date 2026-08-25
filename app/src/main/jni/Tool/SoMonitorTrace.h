@@ -36,7 +36,10 @@ struct SoTraceState
     size_t threadCount = 0;
     size_t insnSlots = 0;
     uint64_t totalExecutions = 0;
-    uint64_t calloutFires = 0;
+    uint64_t sampleHits = 0;
+    uint64_t hookHits = 0;
+    uint64_t sampleRounds = 0;
+    size_t hookedCount = 0;
 };
 
 namespace SoMonitorTrace

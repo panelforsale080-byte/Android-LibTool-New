@@ -20,8 +20,8 @@
 #include <fcntl.h>
 #include <limits.h>
 #include <link.h>
+#include <map>
 #include <mutex>
-#include <pthread.h>
 #include <set>
 #include <sys/stat.h>
 #include <thread>
@@ -32,6 +32,7 @@
 namespace
 {
     static constexpr uint64_t kDenseMaxModuleSize = 16u * 1024u * 1024u;
+    static constexpr size_t kMaxEntryHooks = 8192u;
 
     struct FileExecSegment
     {
@@ -44,11 +45,10 @@ namespace
     SoTraceModule g_module;
     std::string g_status;
     bool g_starting = false;
-    bool g_active = false;
+    std::atomic<bool> g_active{false};
 
-    GumStalker *g_stalker = nullptr;
-    GumStalkerTransformer *g_transformer = nullptr;
-    std::set<GumThreadId> g_followedThreads;
+    std::thread g_samplerThread;
+    std::vector<uint64_t> g_hookedRuntimeAddrs;
 
     std::vector<uint64_t> g_denseHits;
     std::vector<std::string> g_denseMnemonic;
@@ -64,11 +64,14 @@ namespace
     bool g_useDense = true;
 
     std::atomic<uint64_t> g_totalExecutions{0};
-    std::atomic<uint64_t> g_calloutFires{0};
+    std::atomic<uint64_t> g_sampleHits{0};
+    std::atomic<uint64_t> g_hookHits{0};
+    std::atomic<uint64_t> g_sampleRounds{0};
+    std::atomic<size_t> g_lastThreadCount{0};
 
-    typedef int (*pthread_create_fn)(pthread_t *, const pthread_attr_t *, void *(*)(void *), void *);
-    static pthread_create_fn g_origPthreadCreate = nullptr;
-    static bool g_pthreadHooked = false;
+    thread_local bool t_inHook = false;
+
+    static inline unsigned symType(unsigned char info) { return info & 0xf; }
 
     static bool inExecRange(uint64_t address)
     {
@@ -138,18 +141,78 @@ namespace
         return true;
     }
 
-    static bool buildMnemonicTables(const SoTraceModule &module, std::string &err)
+    static void collectDynsymRuntime(std::set<uint64_t> &out)
+    {
+        const int fd = open(g_module.path.c_str(), O_RDONLY);
+        if (fd < 0)
+            return;
+
+        ElfW(Ehdr) ehdr{};
+        if (pread(fd, &ehdr, sizeof(ehdr), 0) != static_cast<ssize_t>(sizeof(ehdr)) ||
+            std::memcmp(ehdr.e_ident, ELFMAG, SELFMAG) != 0 || ehdr.e_shoff == 0 || ehdr.e_shnum == 0)
+        {
+            close(fd);
+            return;
+        }
+
+        std::vector<ElfW(Shdr)> sections(ehdr.e_shnum);
+        const size_t tableSize = sizeof(ElfW(Shdr)) * ehdr.e_shnum;
+        if (pread(fd, sections.data(), tableSize, static_cast<off_t>(ehdr.e_shoff)) != static_cast<ssize_t>(tableSize))
+        {
+            close(fd);
+            return;
+        }
+
+        const ElfW(Shdr) *dynsym = nullptr;
+        for (size_t i = 0; i < sections.size(); ++i)
+        {
+            if (sections[i].sh_type == SHT_DYNSYM)
+            {
+                dynsym = &sections[i];
+                break;
+            }
+        }
+        if (!dynsym || dynsym->sh_entsize == 0 || dynsym->sh_size == 0)
+        {
+            close(fd);
+            return;
+        }
+
+        const size_t symCount = dynsym->sh_size / dynsym->sh_entsize;
+        std::vector<ElfW(Sym)> symbols(symCount);
+        if (pread(fd, symbols.data(), dynsym->sh_size, static_cast<off_t>(dynsym->sh_offset)) !=
+            static_cast<ssize_t>(dynsym->sh_size))
+        {
+            close(fd);
+            return;
+        }
+        close(fd);
+
+        for (const ElfW(Sym) &sym : symbols)
+        {
+            if (sym.st_value == 0 || sym.st_shndx == SHN_UNDEF)
+                continue;
+            const unsigned type = symType(sym.st_info);
+            if (type != STT_FUNC && type != STT_NOTYPE)
+                continue;
+            const uint64_t runtime = g_module.base + sym.st_value;
+            if (inExecRange(runtime))
+                out.insert(runtime);
+        }
+    }
+
+    static bool buildMnemonicTables(const SoTraceModule &module, std::set<uint64_t> &blTargets, std::string &err)
     {
         g_denseHits.clear();
         g_denseMnemonic.clear();
         g_denseIsInsn.clear();
         g_sparseSlots.clear();
+        blTargets.clear();
         g_useDense = module.size <= kDenseMaxModuleSize;
 
         if (g_useDense)
         {
             const size_t slots = static_cast<size_t>((module.size + 3u) / 4u);
-            g_denseHits.clear();
             g_denseHits.resize(slots, 0);
             g_denseMnemonic.resize(slots);
             g_denseIsInsn.resize(slots, 0);
@@ -161,7 +224,7 @@ namespace
             err = "Capstone init failed";
             return false;
         }
-        cs_option(handle, CS_OPT_DETAIL, CS_OPT_OFF);
+        cs_option(handle, CS_OPT_DETAIL, CS_OPT_ON);
 
         const auto segments = loadExecSegmentsFromFile(module);
         if (segments.empty())
@@ -171,7 +234,9 @@ namespace
             return false;
         }
 
+        const uint64_t moduleEnd = module.base + module.size;
         std::unordered_map<uint64_t, std::string> insnMap;
+
         for (const FileExecSegment &seg : segments)
         {
             uint64_t cursor = seg.runtimeStart;
@@ -203,7 +268,20 @@ namespace
                         text += ' ';
                         text += insn[i].op_str;
                     }
-                    insnMap[off] = std::move(text);
+                    insnMap[off] = text;
+
+                    const char *mn = insn[i].mnemonic;
+                    if ((std::strcmp(mn, "bl") == 0 || std::strcmp(mn, "blr") == 0) && insn[i].detail &&
+                        insn[i].detail->arm64.op_count > 0)
+                    {
+                        const cs_arm64_op &op = insn[i].detail->arm64.operands[0];
+                        if (op.type == ARM64_OP_IMM)
+                        {
+                            const uint64_t target = static_cast<uint64_t>(op.imm);
+                            if (target >= module.base && target < moduleEnd && inExecRange(target))
+                                blTargets.insert(target);
+                        }
+                    }
                 }
                 cursor = insn[n - 1].address + insn[n - 1].size;
                 cs_free(insn, n);
@@ -277,130 +355,92 @@ namespace
         }
     }
 
-    static void onInsnCallout(GumCpuContext *cpu_context, gpointer /*user_data*/)
+    static void recordPc(uint64_t pc)
     {
-        g_calloutFires.fetch_add(1, std::memory_order_relaxed);
-        const uint64_t pc = cpu_context->pc;
         if (pc < g_module.base || pc >= g_module.base + g_module.size)
             return;
+        if (!inExecRange(pc))
+            return;
         incrementHit(pc - g_module.base);
+        g_sampleHits.fetch_add(1, std::memory_order_relaxed);
     }
 
-    static void transformBlock(GumStalkerIterator *iterator, GumStalkerWriter * /*output*/, gpointer /*user_data*/)
+    static void onEntryInstrument(void *address, DobbyRegisterContext * /*ctx*/)
     {
-        const cs_insn *insn = nullptr;
-        while (gum_stalker_iterator_next(iterator, &insn))
+        if (!g_active.load(std::memory_order_relaxed) || t_inHook)
+            return;
+        t_inHook = true;
+        const uint64_t runtime = reinterpret_cast<uint64_t>(address);
+        if (runtime >= g_module.base && runtime < g_module.base + g_module.size)
         {
-            // Target lib is the only non-excluded module — instrument every insn here.
-            gum_stalker_iterator_put_callout(iterator, onInsnCallout, nullptr, nullptr);
-            gum_stalker_iterator_keep(iterator);
+            incrementHit(runtime - g_module.base);
+            g_hookHits.fetch_add(1, std::memory_order_relaxed);
         }
+        t_inHook = false;
     }
 
-    static void followThread(GumThreadId threadId)
+    static void sampleThreadContext(GumThreadId /*thread_id*/, GumCpuContext *cpu_context, gpointer /*user_data*/)
     {
-        if (!g_stalker || !g_transformer)
+        if (!g_active.load(std::memory_order_relaxed))
             return;
-        if (g_followedThreads.count(threadId))
-            return;
-        gum_stalker_follow(g_stalker, threadId, g_transformer, nullptr);
-        g_followedThreads.insert(threadId);
+        recordPc(cpu_context->pc);
     }
 
-    static gboolean enumerateFollowThread(const GumThreadDetails *details, gpointer /*user_data*/)
+    static void samplerLoop()
     {
-        followThread(details->id);
-        return TRUE;
-    }
-
-    static void followAllThreads()
-    {
-        gum_process_enumerate_threads(enumerateFollowThread, nullptr);
-    }
-
-    static int hookPthreadCreate(pthread_t *thread, const pthread_attr_t *attr, void *(*startRoutine)(void *),
-                                 void *arg)
-    {
-        const int result = g_origPthreadCreate(thread, attr, startRoutine, arg);
-        if (result == 0 && g_active)
-            followAllThreads();
-        return result;
-    }
-
-    static bool isTargetModule(const GumModuleDetails *details, const SoTraceModule &target)
-    {
-        if (!details)
-            return false;
-        if (details->path && !target.path.empty() && target.path == details->path)
-            return true;
-        if (details->range && details->range->base_address == target.base)
-            return true;
-        if (details->name && !target.name.empty() && target.name == details->name)
-            return true;
-        return false;
-    }
-
-    struct ExcludeCtx
-    {
-        GumStalker *stalker = nullptr;
-        const SoTraceModule *target = nullptr;
-    };
-
-    static void excludeAllExceptTarget(GumStalker *stalker, const SoTraceModule &target)
-    {
-        ExcludeCtx ctx{stalker, &target};
-        gum_process_enumerate_modules(
-            [](const GumModuleDetails *details, gpointer user_data) -> gboolean
-            {
-                auto *c = static_cast<ExcludeCtx *>(user_data);
-                if (!details->range || !c->stalker || !c->target)
+        Gum::Runtime::ref();
+        while (g_active.load(std::memory_order_relaxed))
+        {
+            size_t count = 0;
+            gum_process_enumerate_threads(
+                [](const GumThreadDetails *details, gpointer user_data) -> gboolean
+                {
+                    auto *n = static_cast<size_t *>(user_data);
+                    gum_process_modify_thread(details->id, sampleThreadContext, nullptr);
+                    ++(*n);
                     return TRUE;
-
-                const std::string name = details->name ? details->name : "";
-                const std::string path = details->path ? details->path : "";
-                const bool isTool =
-                    name.find("libTool") != std::string::npos || path.find("libTool") != std::string::npos;
-
-                if (!isTargetModule(details, *c->target) || isTool)
-                    gum_stalker_exclude(c->stalker, details->range);
-                return TRUE;
-            },
-            &ctx);
+                },
+                &count);
+            g_lastThreadCount.store(count, std::memory_order_relaxed);
+            g_sampleRounds.fetch_add(1, std::memory_order_relaxed);
+            usleep(500);
+        }
     }
 
-    static void stopTraceLocked()
+    static size_t installEntryHooks(const std::set<uint64_t> &dynsym, const std::set<uint64_t> &blTargets)
     {
-        if (g_pthreadHooked && g_origPthreadCreate)
-        {
-            DobbyDestroy(reinterpret_cast<void *>(g_origPthreadCreate));
-            g_pthreadHooked = false;
-            g_origPthreadCreate = nullptr;
-        }
+        std::set<uint64_t> merged = dynsym;
+        merged.insert(blTargets.begin(), blTargets.end());
 
-        if (g_stalker)
-        {
-            for (GumThreadId tid : g_followedThreads)
-                gum_stalker_unfollow(g_stalker, tid);
-            g_followedThreads.clear();
-            gum_stalker_flush(g_stalker);
-        }
+        g_hookedRuntimeAddrs.clear();
+        if (merged.empty())
+            return 0;
 
-        if (g_transformer)
+        dobby_enable_near_branch_trampoline();
+        size_t failed = 0;
+        for (const uint64_t runtime : merged)
         {
-            g_object_unref(g_transformer);
-            g_transformer = nullptr;
+            if (g_hookedRuntimeAddrs.size() >= kMaxEntryHooks)
+                break;
+            if (DobbyInstrument(reinterpret_cast<void *>(runtime), onEntryInstrument) == 0)
+                g_hookedRuntimeAddrs.push_back(runtime);
+            else
+                ++failed;
         }
-        if (g_stalker)
-        {
-            g_object_unref(g_stalker);
-            g_stalker = nullptr;
-        }
-
-        g_active = false;
-        g_starting = false;
+        dobby_disable_near_branch_trampoline();
+        (void)failed;
+        return g_hookedRuntimeAddrs.size();
     }
 
-    static std::string resolveAppPath(const std::string &raw, std::string &err)
+    static void removeEntryHooks()
+    {
+        for (const uint64_t runtime : g_hookedRuntimeAddrs)
+            DobbyDestroy(reinterpret_cast<void *>(runtime));
+        g_hookedRuntimeAddrs.clear();
+    }
+
+
+    static void removeEntryHooks()(const std::string &raw, std::string &err)
     {
         const char *candidates[] = {
             "/sdcard/Android/data/com.android.support/files",
@@ -448,26 +488,27 @@ namespace
 
     static void startTraceThread(SoTraceModule module)
     {
+        std::thread oldSampler;
         {
             std::lock_guard<std::mutex> lock(g_mutex);
-            stopTraceLocked();
+            g_active.store(false, std::memory_order_release);
+            if (g_samplerThread.joinable())
+                oldSampler = std::move(g_samplerThread);
+            removeEntryHooks();
             g_starting = true;
             g_module = std::move(module);
             g_status = "Building instruction map for " + g_module.name + " ...";
             g_totalExecutions.store(0, std::memory_order_relaxed);
-            g_calloutFires.store(0, std::memory_order_relaxed);
+            g_sampleHits.store(0, std::memory_order_relaxed);
+            g_hookHits.store(0, std::memory_order_relaxed);
+            g_sampleRounds.store(0, std::memory_order_relaxed);
         }
+        if (oldSampler.joinable())
+            oldSampler.join();
 
-        if (!gum_stalker_is_supported())
-        {
-            std::lock_guard<std::mutex> lock(g_mutex);
-            g_starting = false;
-            g_status = "Stalker not supported on this device.";
-            return;
-        }
-
+        std::set<uint64_t> blTargets;
         std::string err;
-        if (!buildMnemonicTables(g_module, err))
+        if (!buildMnemonicTables(g_module, blTargets, err))
         {
             std::lock_guard<std::mutex> lock(g_mutex);
             g_starting = false;
@@ -475,39 +516,26 @@ namespace
             return;
         }
 
+        std::set<uint64_t> dynsym;
+        collectDynsymRuntime(dynsym);
+
         {
             std::lock_guard<std::mutex> lock(g_mutex);
-            g_status = "Starting Stalker on all threads ...";
+            g_status = "Installing PC sampler + entry hooks ...";
         }
 
-        Gum::Runtime::ref();
+        const size_t hookCount = installEntryHooks(dynsym, blTargets);
 
-        g_stalker = gum_stalker_new();
-        g_transformer = gum_stalker_transformer_make_from_callback(transformBlock, nullptr, nullptr);
-        // -1 = never trust blocks (always keep instrumentation). 0 would skip instrumentation immediately.
-        gum_stalker_set_trust_threshold(g_stalker, -1);
-        excludeAllExceptTarget(g_stalker, g_module);
-        followAllThreads();
-        gum_stalker_flush(g_stalker);
-
-        void *pthreadCreateAddr = reinterpret_cast<void *>(gum_module_find_export_by_name("libc.so", "pthread_create"));
-        if (!pthreadCreateAddr)
-            pthreadCreateAddr = dlsym(RTLD_DEFAULT, "pthread_create");
-
-        if (pthreadCreateAddr && DobbyHook(pthreadCreateAddr, reinterpret_cast<dobby_dummy_func_t>(hookPthreadCreate),
-                                           reinterpret_cast<dobby_dummy_func_t *>(&g_origPthreadCreate)) == 0)
-        {
-            g_pthreadHooked = true;
-        }
+        g_active.store(true, std::memory_order_release);
+        g_samplerThread = std::thread(samplerLoop);
 
         {
             std::lock_guard<std::mutex> lock(g_mutex);
             g_starting = false;
-            g_active = true;
             const size_t slots = g_useDense ? g_denseMnemonic.size() : g_sparseSlots.size();
-            g_status = "Runtime tracing " + g_module.name + " (" + std::to_string(g_followedThreads.size()) +
-                       " threads, " + std::to_string(slots) +
-                       " insn slots). Play the game — hits update live.";
+            g_status = "Tracing " + g_module.name + " [PC sampler + " + std::to_string(hookCount) +
+                       " entry hooks, " + std::to_string(slots) +
+                       " slots]. Play the game — hits update live.";
         }
     }
 } // namespace
@@ -521,24 +549,36 @@ namespace SoMonitorTrace
 
     void Stop()
     {
-        std::lock_guard<std::mutex> lock(g_mutex);
-        stopTraceLocked();
-        g_status = "Runtime trace stopped.";
+        std::thread oldSampler;
+        {
+            std::lock_guard<std::mutex> lock(g_mutex);
+            g_active.store(false, std::memory_order_release);
+            if (g_samplerThread.joinable())
+                oldSampler = std::move(g_samplerThread);
+            removeEntryHooks();
+            g_starting = false;
+            g_status = "Runtime trace stopped.";
+        }
+        if (oldSampler.joinable())
+            oldSampler.join();
     }
 
     SoTraceState GetState()
     {
         SoTraceState state;
         std::lock_guard<std::mutex> lock(g_mutex);
-        state.active = g_active;
+        state.active = g_active.load(std::memory_order_relaxed);
         state.starting = g_starting;
         state.status = g_status;
         state.moduleName = g_module.name;
         state.base = g_module.base;
-        state.threadCount = g_followedThreads.size();
+        state.threadCount = g_lastThreadCount.load(std::memory_order_relaxed);
         state.insnSlots = g_useDense ? g_denseMnemonic.size() : g_sparseSlots.size();
         state.totalExecutions = g_totalExecutions.load(std::memory_order_relaxed);
-        state.calloutFires = g_calloutFires.load(std::memory_order_relaxed);
+        state.sampleHits = g_sampleHits.load(std::memory_order_relaxed);
+        state.hookHits = g_hookHits.load(std::memory_order_relaxed);
+        state.sampleRounds = g_sampleRounds.load(std::memory_order_relaxed);
+        state.hookedCount = g_hookedRuntimeAddrs.size();
         return state;
     }
 
@@ -615,17 +655,18 @@ namespace SoMonitorTrace
                 __atomic_store_n(&slot.hits, 0ULL, __ATOMIC_RELAXED);
         }
         g_totalExecutions.store(0, std::memory_order_relaxed);
+        g_sampleHits.store(0, std::memory_order_relaxed);
+        g_hookHits.store(0, std::memory_order_relaxed);
     }
 
     bool ExportCsv(const std::string &fileName, std::string &outPath)
     {
-        std::vector<SoTraceHitEntry> rows;
         std::string moduleName;
         {
             std::lock_guard<std::mutex> lock(g_mutex);
             moduleName = g_module.name;
         }
-        rows = GetSnapshot(false, 0, true);
+        const std::vector<SoTraceHitEntry> rows = GetSnapshot(false, 0, true);
 
         std::string err;
         const std::string full = resolveAppPath(fileName, err);

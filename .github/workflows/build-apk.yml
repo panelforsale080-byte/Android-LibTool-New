@@ -43,8 +43,8 @@ jobs:
           APK=$(ls app/build/outputs/apk/debug/*.apk | head -1)
           NAME=$(basename "$APK")
           cp "$APK" "/tmp/${NAME}"
-          gh release delete "v3.4.1" -y 2>/dev/null || true
-          gh release create "v3.4.1" \
-            --title "Android LibTool v3.4.1" \
-            --notes "Fix runtime trace: Stalker trust_threshold -1, exclude all modules except target lib." \
+          gh release delete "v3.4.2" -y 2>/dev/null || true
+          gh release create "v3.4.2" \
+            --title "Android LibTool v3.4.2" \
+            --notes "Replace broken Stalker with PC sampler + Dobby entry hooks for reliable runtime hit counts." \
             "/tmp/${NAME}#${NAME}"
