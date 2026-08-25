@@ -23,6 +23,7 @@
 #include <cstring>
 #include <elf.h>
 #include <fcntl.h>
+#include <limits.h>
 #include <sys/stat.h>
 #include <link.h>
 #include <map>
@@ -483,7 +484,7 @@ namespace
         cs_close(&handle);
         fclose(f);
 
-        char absBuf[512] = {};
+        char absBuf[PATH_MAX] = {};
         if (realpath(full.c_str(), absBuf)) outPath = absBuf;
         else outPath = full;
         outPath += " (" + std::to_string(total) + " instructions)";
@@ -531,7 +532,7 @@ namespace
             ++written;
         }
         fclose(f);
-        char absBuf[512] = {};
+        char absBuf[PATH_MAX] = {};
         if (realpath(full.c_str(), absBuf)) outPath = absBuf;
         else outPath = full;
         outPath += " (" + std::to_string(written) + " captured calls)";
