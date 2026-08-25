@@ -1021,7 +1021,7 @@ namespace SoMonitor
 
         static bool hideZeroHits = true;
         static bool sortByHits = true;
-        static int minHits = 1;
+        static int minHits = 0;
         static char traceFilter[64] = {};
         static char traceCsvName[128] = {};
         static std::string traceExportStatus;
