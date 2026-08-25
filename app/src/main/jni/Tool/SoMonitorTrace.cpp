@@ -64,6 +64,7 @@ namespace
     bool g_useDense = true;
 
     std::atomic<uint64_t> g_totalExecutions{0};
+    std::atomic<uint64_t> g_calloutFires{0};
 
     typedef int (*pthread_create_fn)(pthread_t *, const pthread_attr_t *, void *(*)(void *), void *);
     static pthread_create_fn g_origPthreadCreate = nullptr;
@@ -278,10 +279,9 @@ namespace
 
     static void onInsnCallout(GumCpuContext *cpu_context, gpointer /*user_data*/)
     {
+        g_calloutFires.fetch_add(1, std::memory_order_relaxed);
         const uint64_t pc = cpu_context->pc;
         if (pc < g_module.base || pc >= g_module.base + g_module.size)
-            return;
-        if (!inExecRange(pc))
             return;
         incrementHit(pc - g_module.base);
     }
@@ -291,8 +291,8 @@ namespace
         const cs_insn *insn = nullptr;
         while (gum_stalker_iterator_next(iterator, &insn))
         {
-            if (insn && inExecRange(static_cast<uint64_t>(insn->address)))
-                gum_stalker_iterator_put_callout(iterator, onInsnCallout, nullptr, nullptr);
+            // Target lib is the only non-excluded module — instrument every insn here.
+            gum_stalker_iterator_put_callout(iterator, onInsnCallout, nullptr, nullptr);
             gum_stalker_iterator_keep(iterator);
         }
     }
@@ -327,24 +327,45 @@ namespace
         return result;
     }
 
-    static void excludeSelfAndSystem(GumStalker *stalker)
+    static bool isTargetModule(const GumModuleDetails *details, const SoTraceModule &target)
     {
+        if (!details)
+            return false;
+        if (details->path && !target.path.empty() && target.path == details->path)
+            return true;
+        if (details->range && details->range->base_address == target.base)
+            return true;
+        if (details->name && !target.name.empty() && target.name == details->name)
+            return true;
+        return false;
+    }
+
+    struct ExcludeCtx
+    {
+        GumStalker *stalker = nullptr;
+        const SoTraceModule *target = nullptr;
+    };
+
+    static void excludeAllExceptTarget(GumStalker *stalker, const SoTraceModule &target)
+    {
+        ExcludeCtx ctx{stalker, &target};
         gum_process_enumerate_modules(
             [](const GumModuleDetails *details, gpointer user_data) -> gboolean
             {
-                auto *s = static_cast<GumStalker *>(user_data);
-                if (!details->range)
+                auto *c = static_cast<ExcludeCtx *>(user_data);
+                if (!details->range || !c->stalker || !c->target)
                     return TRUE;
+
                 const std::string name = details->name ? details->name : "";
                 const std::string path = details->path ? details->path : "";
-                if (name.find("libTool") != std::string::npos || path.find("libTool") != std::string::npos ||
-                    name.find("linker") != std::string::npos || name.find("libdl") != std::string::npos)
-                {
-                    gum_stalker_exclude(s, details->range);
-                }
+                const bool isTool =
+                    name.find("libTool") != std::string::npos || path.find("libTool") != std::string::npos;
+
+                if (!isTargetModule(details, *c->target) || isTool)
+                    gum_stalker_exclude(c->stalker, details->range);
                 return TRUE;
             },
-            stalker);
+            &ctx);
     }
 
     static void stopTraceLocked()
@@ -434,6 +455,7 @@ namespace
             g_module = std::move(module);
             g_status = "Building instruction map for " + g_module.name + " ...";
             g_totalExecutions.store(0, std::memory_order_relaxed);
+            g_calloutFires.store(0, std::memory_order_relaxed);
         }
 
         if (!gum_stalker_is_supported())
@@ -462,9 +484,11 @@ namespace
 
         g_stalker = gum_stalker_new();
         g_transformer = gum_stalker_transformer_make_from_callback(transformBlock, nullptr, nullptr);
-        gum_stalker_set_trust_threshold(g_stalker, 0);
-        excludeSelfAndSystem(g_stalker);
+        // -1 = never trust blocks (always keep instrumentation). 0 would skip instrumentation immediately.
+        gum_stalker_set_trust_threshold(g_stalker, -1);
+        excludeAllExceptTarget(g_stalker, g_module);
         followAllThreads();
+        gum_stalker_flush(g_stalker);
 
         void *pthreadCreateAddr = reinterpret_cast<void *>(gum_module_find_export_by_name("libc.so", "pthread_create"));
         if (!pthreadCreateAddr)
@@ -482,7 +506,8 @@ namespace
             g_active = true;
             const size_t slots = g_useDense ? g_denseMnemonic.size() : g_sparseSlots.size();
             g_status = "Runtime tracing " + g_module.name + " (" + std::to_string(g_followedThreads.size()) +
-                       " threads, " + std::to_string(slots) + " insn slots). Heavy — stop when done.";
+                       " threads, " + std::to_string(slots) +
+                       " insn slots). Play the game — hits update live.";
         }
     }
 } // namespace
@@ -513,6 +538,7 @@ namespace SoMonitorTrace
         state.threadCount = g_followedThreads.size();
         state.insnSlots = g_useDense ? g_denseMnemonic.size() : g_sparseSlots.size();
         state.totalExecutions = g_totalExecutions.load(std::memory_order_relaxed);
+        state.calloutFires = g_calloutFires.load(std::memory_order_relaxed);
         return state;
     }
 

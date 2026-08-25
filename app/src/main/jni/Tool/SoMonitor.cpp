@@ -860,6 +860,15 @@ namespace
 
     void startRuntimeTrace(const ModuleInfo &module)
     {
+        refreshModules();
+        for (const ModuleInfo &m : g_modules)
+        {
+            if (m.path == module.path || m.name == module.name)
+            {
+                SoMonitorTrace::Start(toTraceModule(m));
+                return;
+            }
+        }
         SoMonitorTrace::Start(toTraceModule(module));
     }
 } // namespace
@@ -991,8 +1000,12 @@ namespace SoMonitor
         else if (traceState.active && traceState.base == module.base && traceState.moduleName == module.name)
         {
             ImGui::TextColored(ImVec4(0.3f, 1.0f, 0.4f, 1.0f), "%s", traceState.status.c_str());
-            ImGui::TextDisabled("%zu threads | %zu insn slots | %" PRIu64 " total executions", traceState.threadCount,
-                               traceState.insnSlots, traceState.totalExecutions);
+            ImGui::TextDisabled("%zu threads | %zu insn slots | %" PRIu64 " hits | %" PRIu64 " callouts",
+                               traceState.threadCount, traceState.insnSlots, traceState.totalExecutions,
+                               traceState.calloutFires);
+            if (traceState.calloutFires == 0)
+                ImGui::TextColored(ImVec4(1.0f, 0.5f, 0.3f, 1.0f),
+                                   "No callouts yet — interact with the game (callouts=0 means Stalker not firing).");
             if (ImGui::Button("Stop runtime trace", ImVec2(-1, 0)))
                 SoMonitorTrace::Stop();
         }

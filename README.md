@@ -2,15 +2,21 @@
 
 Native Android mod menu for **authorized** IL2CPP / Unity testing on apps and devices you own or have permission to inspect.
 
-**Version:** 3.4.0
+**Version:** 3.4.1
 
 ## Download APK (public)
 
-**Direct link:** https://github.com/panelforsale080-byte/Android-LibTool-New/releases/download/v3.4.0/app-debug.apk
+**Direct link:** https://github.com/panelforsale080-byte/Android-LibTool-New/releases/download/v3.4.1/app-debug.apk
 
-**Release page:** https://github.com/panelforsale080-byte/Android-LibTool-New/releases/tag/v3.4.0
+**Release page:** https://github.com/panelforsale080-byte/Android-LibTool-New/releases/tag/v3.4.1
 
 > arm64-v8a debug APK (modern 64-bit phones). Delete the GitHub repo/release when you no longer need it.
+
+## What's new in v3.4.1
+
+- **Runtime trace fix** — Stalker `trust_threshold = -1` (was 0, which disabled instrumentation immediately)
+- **Target-only stalking** — excludes all other modules so only the selected `.so` is instrumented
+- Fresh module base refresh before trace start; callout diagnostic counter in UI
 
 ## What's new in v3.4.0
 
