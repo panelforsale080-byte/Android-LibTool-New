@@ -1032,6 +1032,7 @@ namespace SoMonitor
                 ImGui::TextDisabled("Hook cap for this lib size: %zu", traceState.hookCap);
             if (traceState.hookFailed > 0)
                 ImGui::TextDisabled("%zu hook installs failed (cap or unsupported insn)", traceState.hookFailed);
+            if (traceState.totalExecutions == 0 && traceState.sampleRounds > 100)
                 ImGui::TextColored(ImVec4(1.0f, 0.5f, 0.3f, 1.0f),
                                    "0 hits — play the game, or use Hook this offset on a known function.");
             else if (traceState.sampleRounds == 0)
