@@ -18,6 +18,7 @@
 #include <dlfcn.h>
 #include <fcntl.h>
 #include <limits.h>
+#include <link.h>
 #include <mutex>
 #include <set>
 #include <sys/stat.h>
