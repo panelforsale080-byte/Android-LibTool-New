@@ -921,7 +921,7 @@ namespace SoMonitor
         }
         ImGui::PopStyleVar(2);
         ImGui::TextDisabled(
-            "Step 1: pick the game lib — full Stalker instruction trace (sub/sp/str/... every insn).");
+            "Step 1: pick the game lib — runtime call hooks (like IL2CPP Tracer) + PC sampler.");
         if (!MenuLayout::IsNarrowLayout())
         {
             const char *preview = "No module selected";
@@ -982,7 +982,19 @@ namespace SoMonitor
             }
             uint64_t va, vo;
             if (parseHex(convAddr, va) && parseHex(convOff, vo))
+            {
                 ImGui::Text("%s  =  %s + %s", convAddr, hex(module.base).c_str(), convOff);
+                static std::string hookStatus;
+                if (ImGui::Button("Hook this offset##tracehook"))
+                {
+                    if (SoMonitorTrace::HookOffset(vo, hookStatus))
+                        hookStatus = "Hooked +0x" + hex(vo).substr(2);
+                    else if (hookStatus.empty())
+                        hookStatus = "Hook failed.";
+                }
+                if (!hookStatus.empty())
+                    ImGui::TextWrapped("%s", hookStatus.c_str());
+            }
         }
         ImGui::Separator();
 
@@ -1000,17 +1012,19 @@ namespace SoMonitor
         else if (traceState.active && traceState.base == module.base && traceState.moduleName == module.name)
         {
             ImGui::TextColored(ImVec4(0.3f, 1.0f, 0.4f, 1.0f), "%s", traceState.status.c_str());
-            ImGui::TextDisabled("%zu threads | %zu slots | %" PRIu64 " insn hits | %" PRIu64 " callouts | %" PRIu64 " blocks",
-                               traceState.threadCount, traceState.insnSlots,
-                               traceState.totalExecutions, traceState.calloutFires,
-                               traceState.blocksInstrumented);
-            if (traceState.totalExecutions == 0 && traceState.calloutFires > 1000)
+            ImGui::TextDisabled(
+                "%zu threads | %zu hooks (%zu gum + %zu dobby) | %zu slots | %" PRIu64 " hits | call:%" PRIu64
+                " sample:%" PRIu64 " rounds:%" PRIu64,
+                traceState.threadCount, traceState.hookedCount, traceState.interceptorCount, traceState.dobbyCount,
+                traceState.insnSlots, traceState.totalExecutions, traceState.hookHits, traceState.sampleHits,
+                traceState.sampleRounds);
+            if (traceState.hookFailed > 0)
+                ImGui::TextDisabled("%zu hook installs failed (cap or unsupported insn)", traceState.hookFailed);
+            if (traceState.totalExecutions == 0 && traceState.sampleRounds > 100)
                 ImGui::TextColored(ImVec4(1.0f, 0.5f, 0.3f, 1.0f),
-                                   "Stalker running but 0 hits in target lib — play the game or pick another .so.");
-            else if (traceState.totalExecutions == 0 && traceState.threadCount == 0)
-                ImGui::TextColored(ImVec4(1.0f, 0.5f, 0.3f, 1.0f), "Waiting for threads to follow ...");
-            else if (!traceState.stalkerSupported)
-                ImGui::TextColored(ImVec4(1.0f, 0.3f, 0.3f, 1.0f), "Stalker not supported on this device.");
+                                   "0 hits — play the game, or use Hook this offset on a known function.");
+            else if (traceState.sampleRounds == 0)
+                ImGui::TextColored(ImVec4(1.0f, 0.5f, 0.3f, 1.0f), "Starting hooks + sampler ...");
             if (ImGui::Button("Stop runtime trace", ImVec2(-1, 0)))
                 SoMonitorTrace::Stop();
         }
@@ -1021,7 +1035,8 @@ namespace SoMonitor
                 startRuntimeTrace(module);
         }
 
-        ImGui::TextDisabled("Full lib runtime trace via Frida Stalker — every executed instruction, no time limit.");
+        ImGui::TextDisabled(
+            "Call hooks = exact entry hits (exports/BL/prologue). PC sampler = hot instruction lines between calls.");
         ImGui::Separator();
 
         static bool hideZeroHits = true;
