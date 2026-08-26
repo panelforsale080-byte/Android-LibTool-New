@@ -921,7 +921,7 @@ namespace SoMonitor
         }
         ImGui::PopStyleVar(2);
         ImGui::TextDisabled(
-            "Step 1: pick the game lib — PC sampler + entry hooks trace (works without Stalker).");
+            "Step 1: pick the game lib — full Stalker instruction trace (sub/sp/str/... every insn).");
         if (!MenuLayout::IsNarrowLayout())
         {
             const char *preview = "No module selected";
@@ -1000,15 +1000,17 @@ namespace SoMonitor
         else if (traceState.active && traceState.base == module.base && traceState.moduleName == module.name)
         {
             ImGui::TextColored(ImVec4(0.3f, 1.0f, 0.4f, 1.0f), "%s", traceState.status.c_str());
-            ImGui::TextDisabled("%zu threads | %zu hooks | %zu slots | %" PRIu64 " hits | sample:%" PRIu64 " hook:%" PRIu64 " rounds:%" PRIu64,
-                               traceState.threadCount, traceState.hookedCount, traceState.insnSlots,
-                               traceState.totalExecutions, traceState.sampleHits, traceState.hookHits,
-                               traceState.sampleRounds);
-            if (traceState.totalExecutions == 0 && traceState.sampleRounds > 50)
+            ImGui::TextDisabled("%zu threads | %zu slots | %" PRIu64 " insn hits | %" PRIu64 " callouts | %" PRIu64 " blocks",
+                               traceState.threadCount, traceState.insnSlots,
+                               traceState.totalExecutions, traceState.calloutFires,
+                               traceState.blocksInstrumented);
+            if (traceState.totalExecutions == 0 && traceState.calloutFires > 1000)
                 ImGui::TextColored(ImVec4(1.0f, 0.5f, 0.3f, 1.0f),
-                                   "Sampler running but 0 hits — make sure game code in this lib is executing.");
-            else if (traceState.sampleRounds == 0)
-                ImGui::TextColored(ImVec4(1.0f, 0.5f, 0.3f, 1.0f), "Starting sampler ...");
+                                   "Stalker running but 0 hits in target lib — play the game or pick another .so.");
+            else if (traceState.totalExecutions == 0 && traceState.threadCount == 0)
+                ImGui::TextColored(ImVec4(1.0f, 0.5f, 0.3f, 1.0f), "Waiting for threads to follow ...");
+            else if (!traceState.stalkerSupported)
+                ImGui::TextColored(ImVec4(1.0f, 0.3f, 0.3f, 1.0f), "Stalker not supported on this device.");
             if (ImGui::Button("Stop runtime trace", ImVec2(-1, 0)))
                 SoMonitorTrace::Stop();
         }
@@ -1019,7 +1021,7 @@ namespace SoMonitor
                 startRuntimeTrace(module);
         }
 
-        ImGui::TextDisabled("PC sampler polls all threads ~2kHz + Dobby hooks on exports/BL targets.");
+        ImGui::TextDisabled("Full lib runtime trace via Frida Stalker — every executed instruction, no time limit.");
         ImGui::Separator();
 
         static bool hideZeroHits = true;

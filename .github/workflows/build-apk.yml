@@ -43,8 +43,8 @@ jobs:
           APK=$(ls app/build/outputs/apk/debug/*.apk | head -1)
           NAME=$(basename "$APK")
           cp "$APK" "/tmp/${NAME}"
-          gh release delete "v3.4.2" -y 2>/dev/null || true
-          gh release create "v3.4.2" \
-            --title "Android LibTool v3.4.2" \
-            --notes "Replace broken Stalker with PC sampler + Dobby entry hooks for reliable runtime hit counts." \
+          gh release delete "v3.5.0" -y 2>/dev/null || true
+          gh release create "v3.5.0" \
+            --title "Android LibTool v3.5.0" \
+            --notes "Full runtime instruction trace via Frida Stalker — every executed insn (sub/sp/str/...) with hit counts, no time limit." \
             "/tmp/${NAME}#${NAME}"
