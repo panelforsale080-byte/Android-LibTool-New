@@ -27,12 +27,15 @@
 #include <thread>
 #include <unistd.h>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 namespace
 {
-    static constexpr uint64_t kDenseMaxModuleSize = 16u * 1024u * 1024u;
-    static constexpr size_t kMaxEntryHooks = 65536u;
+    // Dense mnemonic table only for libs <= 4 MB. Larger libs use lazy hit maps.
+    static constexpr uint64_t kDenseMaxModuleSize = 4u * 1024u * 1024u;
+    static constexpr uint64_t kPrologueScanMaxSize = 4u * 1024u * 1024u;
+    static constexpr size_t kHookBatchSize = 48;
 
     struct FileExecSegment
     {
@@ -46,10 +49,13 @@ namespace
     std::string g_status;
     bool g_starting = false;
     std::atomic<bool> g_active{false};
+    std::atomic<bool> g_cancelInstall{false};
+    std::atomic<bool> g_hookInstalling{false};
 
     std::thread g_samplerThread;
     std::vector<uint64_t> g_interceptorAddrs;
     std::vector<uint64_t> g_dobbyAddrs;
+    std::unordered_set<uint64_t> g_hookedSet;
 
     Gum::RefPtr<Gum::Interceptor> g_interceptor;
     std::unique_ptr<Gum::InvocationListener> g_entryListener;
@@ -66,6 +72,10 @@ namespace
     };
     std::vector<SparseSlot> g_sparseSlots;
     bool g_useDense = true;
+    bool g_lazyMode = false;
+
+    std::unordered_map<uint64_t, uint64_t> g_lazyHits;
+    std::unordered_map<uint64_t, std::string> g_lazyMnemonic;
 
     std::atomic<uint64_t> g_totalExecutions{0};
     std::atomic<uint64_t> g_sampleHits{0};
@@ -73,8 +83,22 @@ namespace
     std::atomic<uint64_t> g_sampleRounds{0};
     std::atomic<size_t> g_lastThreadCount{0};
     std::atomic<size_t> g_hookFailed{0};
+    std::atomic<size_t> g_hookInstallDone{0};
+    std::atomic<size_t> g_hookInstallTotal{0};
+    std::atomic<size_t> g_hookCap{0};
 
     thread_local bool t_inHook = false;
+
+    static size_t hookCapForModule(uint64_t size)
+    {
+        if (size <= 2u * 1024u * 1024u)
+            return 8192;
+        if (size <= 6u * 1024u * 1024u)
+            return 3072;
+        if (size <= 12u * 1024u * 1024u)
+            return 1536;
+        return 768;
+    }
 
     static inline unsigned symType(unsigned char info) { return info & 0xf; }
 
@@ -170,6 +194,51 @@ namespace
         return true;
     }
 
+    static std::string disasmOneRuntime(uint64_t runtime, const std::vector<FileExecSegment> &segments)
+    {
+        uint8_t buffer[16]{};
+        if (!readAtRuntimeVa(g_module, segments, runtime, buffer, sizeof(buffer)))
+            return "???";
+
+        csh handle = 0;
+        if (cs_open(CS_ARCH_ARM64, CS_MODE_ARM, &handle) != CS_ERR_OK)
+            return "???";
+
+        cs_insn *insn = nullptr;
+        const size_t n = cs_disasm(handle, buffer, sizeof(buffer), runtime, 1, &insn);
+        std::string text = "???";
+        if (n > 0)
+        {
+            text = insn[0].mnemonic;
+            if (insn[0].op_str[0] != '\0')
+            {
+                text += ' ';
+                text += insn[0].op_str;
+            }
+            cs_free(insn, n);
+        }
+        cs_close(&handle);
+        return text;
+    }
+
+    static void rememberMnemonic(uint64_t offset, const std::string &text)
+    {
+        if (g_lazyMode)
+        {
+            g_lazyMnemonic[offset] = text;
+            return;
+        }
+        if (g_useDense)
+        {
+            const size_t slot = static_cast<size_t>(offset >> 2);
+            if (slot < g_denseMnemonic.size())
+            {
+                g_denseMnemonic[slot] = text;
+                g_denseIsInsn[slot] = 1;
+            }
+        }
+    }
+
     static void collectDynsymRuntime(std::set<uint64_t> &out)
     {
         const int fd = open(g_module.path.c_str(), O_RDONLY);
@@ -230,40 +299,12 @@ namespace
         }
     }
 
-    static void collectPrologueEntries(const std::unordered_map<uint64_t, std::string> &insnMap,
-                                       std::set<uint64_t> &out)
+    static bool scanHookTargets(const SoTraceModule &module, const std::vector<FileExecSegment> &segments,
+                                std::set<uint64_t> &blTargets, std::set<uint64_t> &prologueTargets,
+                                std::unordered_map<uint64_t, std::string> *fullInsnMap, std::string &err)
     {
-        for (const auto &kv : insnMap)
-        {
-            const std::string &text = kv.second;
-            if (text.rfind("sub sp", 0) == 0 || text.rfind("stp x29", 0) == 0 || text.rfind("stp x30", 0) == 0 ||
-                text.rfind("pacibsp", 0) == 0)
-            {
-                const uint64_t runtime = g_module.base + kv.first;
-                if (inExecRange(runtime))
-                    out.insert(runtime);
-            }
-        }
-    }
-
-    static bool buildMnemonicTables(const SoTraceModule &module, std::set<uint64_t> &blTargets,
-                                    std::set<uint64_t> &prologueTargets, std::string &err)
-    {
-        g_denseHits.clear();
-        g_denseMnemonic.clear();
-        g_denseIsInsn.clear();
-        g_sparseSlots.clear();
         blTargets.clear();
         prologueTargets.clear();
-        g_useDense = module.size <= kDenseMaxModuleSize;
-
-        if (g_useDense)
-        {
-            const size_t slots = static_cast<size_t>((module.size + 3u) / 4u);
-            g_denseHits.resize(slots, 0);
-            g_denseMnemonic.resize(slots);
-            g_denseIsInsn.resize(slots, 0);
-        }
 
         csh handle = 0;
         if (cs_open(CS_ARCH_ARM64, CS_MODE_ARM, &handle) != CS_ERR_OK)
@@ -271,24 +312,26 @@ namespace
             err = "Capstone init failed";
             return false;
         }
-        cs_option(handle, CS_OPT_DETAIL, CS_OPT_ON);
 
-        const auto segments = loadExecSegmentsFromFile(module);
-        if (segments.empty())
-        {
-            cs_close(&handle);
-            err = "No executable segments in " + module.name;
-            return false;
-        }
+        const bool needDetail = true;
+        cs_option(handle, CS_OPT_DETAIL, needDetail ? CS_OPT_ON : CS_OPT_OFF);
 
         const uint64_t moduleEnd = module.base + module.size;
-        std::unordered_map<uint64_t, std::string> insnMap;
+        const bool scanPrologue = module.size <= kPrologueScanMaxSize;
+        size_t insnSeen = 0;
 
         for (const FileExecSegment &seg : segments)
         {
             uint64_t cursor = seg.runtimeStart;
             while (cursor < seg.runtimeEnd)
             {
+                if (g_cancelInstall.load(std::memory_order_relaxed))
+                {
+                    cs_close(&handle);
+                    err = "Trace cancelled.";
+                    return false;
+                }
+
                 uint8_t buffer[4096];
                 const size_t chunk = std::min(sizeof(buffer), static_cast<size_t>(seg.runtimeEnd - cursor));
                 if (!readAtRuntimeVa(module, segments, cursor, buffer, chunk))
@@ -308,16 +351,30 @@ namespace
 
                 for (size_t i = 0; i < n; ++i)
                 {
+                    ++insnSeen;
                     const uint64_t off = insn[i].address - module.base;
-                    std::string text = std::string(insn[i].mnemonic);
-                    if (insn[i].op_str[0] != '\0')
-                    {
-                        text += ' ';
-                        text += insn[i].op_str;
-                    }
-                    insnMap[off] = text;
-
                     const char *mn = insn[i].mnemonic;
+
+                    if (fullInsnMap)
+                    {
+                        std::string text = std::string(mn);
+                        if (insn[i].op_str[0] != '\0')
+                        {
+                            text += ' ';
+                            text += insn[i].op_str;
+                        }
+                        (*fullInsnMap)[off] = std::move(text);
+                    }
+                    else if (scanPrologue)
+                    {
+                        if (std::strcmp(mn, "sub") == 0 && insn[i].op_str[0] == 's' && insn[i].op_str[1] == 'p')
+                            prologueTargets.insert(insn[i].address);
+                        else if (std::strncmp(mn, "stp", 3) == 0)
+                            prologueTargets.insert(insn[i].address);
+                        else if (std::strcmp(mn, "pacibsp") == 0)
+                            prologueTargets.insert(insn[i].address);
+                    }
+
                     if ((std::strcmp(mn, "bl") == 0 || std::strcmp(mn, "blr") == 0) && insn[i].detail &&
                         insn[i].detail->arm64.op_count > 0)
                     {
@@ -336,38 +393,64 @@ namespace
         }
         cs_close(&handle);
 
-        if (insnMap.empty())
+        if (insnSeen == 0)
         {
             err = "No instructions disassembled in " + module.name;
             return false;
         }
 
-        collectPrologueEntries(insnMap, prologueTargets);
+        err.clear();
+        return true;
+    }
+
+    static bool buildMnemonicTables(const SoTraceModule &module, std::set<uint64_t> &blTargets,
+                                    std::set<uint64_t> &prologueTargets, std::string &err)
+    {
+        g_denseHits.clear();
+        g_denseMnemonic.clear();
+        g_denseIsInsn.clear();
+        g_sparseSlots.clear();
+        g_lazyHits.clear();
+        g_lazyMnemonic.clear();
+        blTargets.clear();
+        prologueTargets.clear();
+
+        g_lazyMode = module.size > kDenseMaxModuleSize;
+        g_useDense = !g_lazyMode;
 
         if (g_useDense)
         {
-            for (const auto &kv : insnMap)
-            {
-                const size_t slot = static_cast<size_t>(kv.first >> 2);
-                if (slot >= g_denseMnemonic.size())
-                    continue;
-                g_denseMnemonic[slot] = kv.second;
-                g_denseIsInsn[slot] = 1;
-            }
+            const size_t slots = static_cast<size_t>((module.size + 3u) / 4u);
+            g_denseHits.resize(slots, 0);
+            g_denseMnemonic.resize(slots);
+            g_denseIsInsn.resize(slots, 0);
         }
-        else
+
+        const auto segments = loadExecSegmentsFromFile(module);
+        if (segments.empty())
         {
-            g_sparseSlots.reserve(insnMap.size());
-            for (auto &kv : insnMap)
-            {
-                SparseSlot slot;
-                slot.offset = kv.first;
-                slot.mnemonic = std::move(kv.second);
-                g_sparseSlots.push_back(std::move(slot));
-            }
-            std::sort(g_sparseSlots.begin(), g_sparseSlots.end(),
-                      [](const SparseSlot &a, const SparseSlot &b) { return a.offset < b.offset; });
+            err = "No executable segments in " + module.name;
+            return false;
         }
+
+        if (g_lazyMode)
+        {
+            return scanHookTargets(module, segments, blTargets, prologueTargets, nullptr, err);
+        }
+
+        std::unordered_map<uint64_t, std::string> insnMap;
+        if (!scanHookTargets(module, segments, blTargets, prologueTargets, &insnMap, err))
+            return false;
+
+        for (const auto &kv : insnMap)
+        {
+            const size_t slot = static_cast<size_t>(kv.first >> 2);
+            if (slot >= g_denseMnemonic.size())
+                continue;
+            g_denseMnemonic[slot] = kv.second;
+            g_denseIsInsn[slot] = 1;
+        }
+        insnMap.clear();
 
         err.clear();
         return true;
@@ -375,6 +458,13 @@ namespace
 
     static void incrementHit(uint64_t offset)
     {
+        if (g_lazyMode)
+        {
+            g_lazyHits[offset]++;
+            g_totalExecutions.fetch_add(1, std::memory_order_relaxed);
+            return;
+        }
+
         if (g_useDense)
         {
             const size_t slot = static_cast<size_t>(offset >> 2);
@@ -452,36 +542,32 @@ namespace
                 &count);
             g_lastThreadCount.store(count, std::memory_order_relaxed);
             g_sampleRounds.fetch_add(1, std::memory_order_relaxed);
-            usleep(100);
+            usleep(g_hookInstalling.load(std::memory_order_relaxed) ? 500 : 100);
         }
     }
 
-    static bool hookRuntimeAddr(uint64_t runtime, bool useTransaction)
+    static bool hookRuntimeAddr(uint64_t runtime, bool inBatch)
     {
-        if (!inExecRange(runtime))
+        if (!inExecRange(runtime) || g_hookedSet.count(runtime))
             return false;
 
         if (g_interceptor && g_entryListener)
         {
-            if (useTransaction)
+            const bool ok = inBatch
+                                ? g_interceptor->attach(reinterpret_cast<void *>(runtime), g_entryListener.get(),
+                                                        nullptr)
+                                : ([&]() {
+                                      g_interceptor->begin_transaction();
+                                      const bool attached = g_interceptor->attach(
+                                          reinterpret_cast<void *>(runtime), g_entryListener.get(), nullptr);
+                                      g_interceptor->end_transaction();
+                                      return attached;
+                                  })();
+            if (ok)
             {
-                if (g_interceptor->attach(reinterpret_cast<void *>(runtime), g_entryListener.get(), nullptr))
-                {
-                    g_interceptorAddrs.push_back(runtime);
-                    return true;
-                }
-            }
-            else
-            {
-                g_interceptor->begin_transaction();
-                const bool ok =
-                    g_interceptor->attach(reinterpret_cast<void *>(runtime), g_entryListener.get(), nullptr);
-                g_interceptor->end_transaction();
-                if (ok)
-                {
-                    g_interceptorAddrs.push_back(runtime);
-                    return true;
-                }
+                g_interceptorAddrs.push_back(runtime);
+                g_hookedSet.insert(runtime);
+                return true;
             }
         }
 
@@ -491,6 +577,7 @@ namespace
         if (rc == 0)
         {
             g_dobbyAddrs.push_back(runtime);
+            g_hookedSet.insert(runtime);
             return true;
         }
 
@@ -498,51 +585,95 @@ namespace
         return false;
     }
 
-    static bool isAlreadyHooked(uint64_t runtime)
+    static std::vector<uint64_t> buildHookPlan(const std::set<uint64_t> &dynsym, const std::set<uint64_t> &blTargets,
+                                               const std::set<uint64_t> &prologueTargets, size_t cap)
     {
-        return std::find(g_interceptorAddrs.begin(), g_interceptorAddrs.end(), runtime) != g_interceptorAddrs.end() ||
-               std::find(g_dobbyAddrs.begin(), g_dobbyAddrs.end(), runtime) != g_dobbyAddrs.end();
+        std::vector<uint64_t> plan;
+        plan.reserve(std::min(cap, dynsym.size() + blTargets.size() + prologueTargets.size()));
+        std::unordered_set<uint64_t> seen;
+
+        auto appendUnique = [&](const std::set<uint64_t> &src)
+        {
+            for (const uint64_t runtime : src)
+            {
+                if (plan.size() >= cap)
+                    return;
+                if (!seen.insert(runtime).second)
+                    continue;
+                plan.push_back(runtime);
+            }
+        };
+
+        appendUnique(dynsym);
+        appendUnique(blTargets);
+        if (g_module.size <= kPrologueScanMaxSize)
+            appendUnique(prologueTargets);
+        return plan;
     }
 
-    static size_t installEntryHooks(const std::set<uint64_t> &dynsym, const std::set<uint64_t> &blTargets,
-                                    const std::set<uint64_t> &prologueTargets)
+    static size_t installEntryHooksBatched(const std::vector<uint64_t> &plan,
+                                           const std::vector<FileExecSegment> &segments)
     {
-        std::set<uint64_t> merged = dynsym;
-        merged.insert(blTargets.begin(), blTargets.end());
-        merged.insert(prologueTargets.begin(), prologueTargets.end());
-
         g_interceptorAddrs.clear();
         g_dobbyAddrs.clear();
+        g_hookedSet.clear();
         g_hookFailed.store(0, std::memory_order_relaxed);
+        g_hookInstallDone.store(0, std::memory_order_relaxed);
+        g_hookInstallTotal.store(plan.size(), std::memory_order_relaxed);
+        g_hookInstalling.store(true, std::memory_order_release);
 
-        if (merged.empty())
+        if (plan.empty())
+        {
+            g_hookInstalling.store(false, std::memory_order_release);
             return 0;
+        }
 
         if (!g_interceptor)
             g_interceptor = Gum::RefPtr<Gum::Interceptor>(Gum::Interceptor_obtain());
         if (!g_entryListener)
             g_entryListener = std::make_unique<NativeEntryListener>();
 
-        if (g_interceptor)
-            g_interceptor->begin_transaction();
-
-        for (const uint64_t runtime : merged)
+        size_t installed = 0;
+        for (size_t i = 0; i < plan.size(); i += kHookBatchSize)
         {
-            if (g_interceptorAddrs.size() + g_dobbyAddrs.size() >= kMaxEntryHooks)
+            if (g_cancelInstall.load(std::memory_order_relaxed))
                 break;
-            if (isAlreadyHooked(runtime))
-                continue;
-            hookRuntimeAddr(runtime, true);
+
+            const size_t batchEnd = std::min(plan.size(), i + kHookBatchSize);
+            if (g_interceptor)
+                g_interceptor->begin_transaction();
+
+            for (size_t j = i; j < batchEnd; ++j)
+            {
+                if (hookRuntimeAddr(plan[j], true))
+                {
+                    ++installed;
+                    const uint64_t off = plan[j] - g_module.base;
+                    if (g_lazyMode && !g_lazyMnemonic.count(off))
+                        g_lazyMnemonic[off] = disasmOneRuntime(plan[j], segments);
+                }
+            }
+
+            if (g_interceptor)
+                g_interceptor->end_transaction();
+
+            g_hookInstallDone.store(batchEnd, std::memory_order_relaxed);
+            {
+                std::lock_guard<std::mutex> lock(g_mutex);
+                g_status = "Installing hooks " + std::to_string(batchEnd) + "/" + std::to_string(plan.size()) +
+                           " (batched, lib " + std::to_string(g_module.size / (1024 * 1024)) + " MB) ...";
+            }
+            usleep(8000);
         }
 
-        if (g_interceptor)
-            g_interceptor->end_transaction();
-
-        return g_interceptorAddrs.size() + g_dobbyAddrs.size();
+        g_hookInstalling.store(false, std::memory_order_release);
+        return installed;
     }
 
     static void removeEntryHooks()
     {
+        g_cancelInstall.store(true, std::memory_order_release);
+
         if (g_interceptor)
         {
             g_interceptor->begin_transaction();
@@ -555,8 +686,12 @@ namespace
 
         g_interceptorAddrs.clear();
         g_dobbyAddrs.clear();
+        g_hookedSet.clear();
         g_interceptor = nullptr;
         g_entryListener.reset();
+        g_hookInstalling.store(false, std::memory_order_release);
+        g_hookInstallDone.store(0, std::memory_order_relaxed);
+        g_hookInstallTotal.store(0, std::memory_order_relaxed);
     }
 
     static std::string resolveAppPath(const std::string &raw, std::string &err)
@@ -611,12 +746,16 @@ namespace
         {
             std::lock_guard<std::mutex> lock(g_mutex);
             g_active.store(false, std::memory_order_release);
+            g_cancelInstall.store(false, std::memory_order_release);
             if (g_samplerThread.joinable())
                 oldSampler = std::move(g_samplerThread);
             removeEntryHooks();
+            g_cancelInstall.store(false, std::memory_order_release);
             g_starting = true;
             g_module = std::move(module);
-            g_status = "Building instruction map for " + g_module.name + " ...";
+            g_hookCap.store(hookCapForModule(g_module.size), std::memory_order_relaxed);
+            g_status = "Scanning " + g_module.name + " (" + std::to_string(g_module.size / (1024 * 1024)) +
+                       " MB, cap " + std::to_string(g_hookCap.load()) + " hooks) ...";
             g_totalExecutions.store(0, std::memory_order_relaxed);
             g_sampleHits.store(0, std::memory_order_relaxed);
             g_hookHits.store(0, std::memory_order_relaxed);
@@ -639,22 +778,27 @@ namespace
         std::set<uint64_t> dynsym;
         collectDynsymRuntime(dynsym);
 
-        {
-            std::lock_guard<std::mutex> lock(g_mutex);
-            g_status = "Installing runtime call hooks (Interceptor + Dobby) ...";
-        }
+        const auto segments = loadExecSegmentsFromFile(g_module);
+        const size_t cap = g_hookCap.load(std::memory_order_relaxed);
+        const std::vector<uint64_t> hookPlan = buildHookPlan(dynsym, blTargets, prologueTargets, cap);
 
-        const size_t hookCount = installEntryHooks(dynsym, blTargets, prologueTargets);
-
+        // Start PC sampler immediately so large libs still get hot-spot data while hooks install.
         g_active.store(true, std::memory_order_release);
         g_samplerThread = std::thread(samplerLoop);
+
+        const size_t hookCount = installEntryHooksBatched(hookPlan, segments);
 
         {
             std::lock_guard<std::mutex> lock(g_mutex);
             g_starting = false;
-            const size_t slots = g_useDense ? g_denseMnemonic.size() : g_sparseSlots.size();
-            g_status = "Tracing " + g_module.name + " [" + std::to_string(hookCount) + " call hooks + PC sampler, " +
-                       std::to_string(slots) + " insn slots]. Play the game — hits update live.";
+            const size_t slots =
+                g_lazyMode ? g_lazyMnemonic.size() : (g_useDense ? g_denseMnemonic.size() : g_sparseSlots.size());
+            g_status = "Tracing " + g_module.name + " [" + std::to_string(hookCount) + "/" +
+                       std::to_string(hookPlan.size()) + " hooks + PC sampler";
+            if (g_lazyMode)
+                g_status += ", lazy mode";
+            g_status += "]. Play the game — hits update live.";
+            (void)slots;
         }
     }
 } // namespace
@@ -671,6 +815,7 @@ namespace SoMonitorTrace
         std::thread oldSampler;
         {
             std::lock_guard<std::mutex> lock(g_mutex);
+            g_cancelInstall.store(true, std::memory_order_release);
             g_active.store(false, std::memory_order_release);
             if (g_samplerThread.joinable())
                 oldSampler = std::move(g_samplerThread);
@@ -688,11 +833,13 @@ namespace SoMonitorTrace
         std::lock_guard<std::mutex> lock(g_mutex);
         state.active = g_active.load(std::memory_order_relaxed);
         state.starting = g_starting;
+        state.hookInstalling = g_hookInstalling.load(std::memory_order_relaxed);
         state.status = g_status;
         state.moduleName = g_module.name;
         state.base = g_module.base;
         state.threadCount = g_lastThreadCount.load(std::memory_order_relaxed);
-        state.insnSlots = g_useDense ? g_denseMnemonic.size() : g_sparseSlots.size();
+        state.insnSlots = g_lazyMode ? g_lazyMnemonic.size()
+                                     : (g_useDense ? g_denseMnemonic.size() : g_sparseSlots.size());
         state.totalExecutions = g_totalExecutions.load(std::memory_order_relaxed);
         state.sampleHits = g_sampleHits.load(std::memory_order_relaxed);
         state.hookHits = g_hookHits.load(std::memory_order_relaxed);
@@ -701,6 +848,9 @@ namespace SoMonitorTrace
         state.interceptorCount = g_interceptorAddrs.size();
         state.dobbyCount = g_dobbyAddrs.size();
         state.hookFailed = g_hookFailed.load(std::memory_order_relaxed);
+        state.hookInstallDone = g_hookInstallDone.load(std::memory_order_relaxed);
+        state.hookInstallTotal = g_hookInstallTotal.load(std::memory_order_relaxed);
+        state.hookCap = g_hookCap.load(std::memory_order_relaxed);
         return state;
     }
 
@@ -709,7 +859,28 @@ namespace SoMonitorTrace
         std::vector<SoTraceHitEntry> out;
         std::lock_guard<std::mutex> lock(g_mutex);
 
-        if (g_useDense)
+        if (g_lazyMode)
+        {
+            out.reserve(g_lazyHits.size());
+            const auto segments = loadExecSegmentsFromFile(g_module);
+            for (const auto &kv : g_lazyHits)
+            {
+                if (hideZeroHits && kv.second == 0)
+                    continue;
+                if (kv.second < minHits)
+                    continue;
+                SoTraceHitEntry entry;
+                entry.offset = kv.first;
+                entry.hits = kv.second;
+                auto mit = g_lazyMnemonic.find(kv.first);
+                if (mit != g_lazyMnemonic.end())
+                    entry.mnemonic = mit->second;
+                else
+                    entry.mnemonic = disasmOneRuntime(g_module.base + kv.first, segments);
+                out.push_back(std::move(entry));
+            }
+        }
+        else if (g_useDense)
         {
             out.reserve(g_denseMnemonic.size() / 8);
             for (size_t slot = 0; slot < g_denseMnemonic.size(); ++slot)
@@ -766,7 +937,11 @@ namespace SoMonitorTrace
     void ClearHits()
     {
         std::lock_guard<std::mutex> lock(g_mutex);
-        if (g_useDense)
+        if (g_lazyMode)
+        {
+            g_lazyHits.clear();
+        }
+        else if (g_useDense)
         {
             for (size_t slot = 0; slot < g_denseHits.size(); ++slot)
                 __atomic_store_n(&g_denseHits[slot], 0ULL, __ATOMIC_RELAXED);
@@ -836,7 +1011,7 @@ namespace SoMonitorTrace
             err = "Offset not in executable segment.";
             return false;
         }
-        if (isAlreadyHooked(runtime))
+        if (g_hookedSet.count(runtime))
         {
             err = "Already hooked.";
             return true;
@@ -846,6 +1021,8 @@ namespace SoMonitorTrace
             err = "Hook failed at this offset.";
             return false;
         }
+        const auto segments = loadExecSegmentsFromFile(g_module);
+        rememberMnemonic(offset, disasmOneRuntime(runtime, segments));
         err.clear();
         return true;
     }

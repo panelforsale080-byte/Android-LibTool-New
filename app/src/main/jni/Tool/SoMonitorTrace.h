@@ -30,6 +30,7 @@ struct SoTraceState
 {
     bool active = false;
     bool starting = false;
+    bool hookInstalling = false;
     std::string status;
     std::string moduleName;
     uint64_t base = 0;
@@ -43,6 +44,9 @@ struct SoTraceState
     size_t interceptorCount = 0;
     size_t dobbyCount = 0;
     size_t hookFailed = 0;
+    size_t hookInstallDone = 0;
+    size_t hookInstallTotal = 0;
+    size_t hookCap = 0;
 };
 
 namespace SoMonitorTrace

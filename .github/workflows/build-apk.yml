@@ -43,8 +43,8 @@ jobs:
           APK=$(ls app/build/outputs/apk/debug/*.apk | head -1)
           NAME=$(basename "$APK")
           cp "$APK" "/tmp/${NAME}"
-          gh release delete "v3.6.0" -y 2>/dev/null || true
-          gh release create "v3.6.0" \
-            --title "Android LibTool v3.6.0" \
-            --notes "Reliable native .so runtime trace: Gum Interceptor call hooks (like IL2CPP Tracer) + PC sampler. Stalker removed — does not work embedded." \
+          gh release delete "v3.6.1" -y 2>/dev/null || true
+          gh release create "v3.6.1" \
+            --title "Android LibTool v3.6.1" \
+            --notes "Optimize runtime hook install for large libs (6–10 MB): batched hooks, size-based caps, lazy mode, no crash on install." \
             "/tmp/${NAME}#${NAME}"

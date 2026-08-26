@@ -1005,9 +1005,19 @@ namespace SoMonitor
                 startRuntimeTrace(module);
         }
 
-        if (traceState.starting)
+        if (traceState.starting || traceState.hookInstalling)
         {
             ImGui::TextColored(ImVec4(1.0f, 0.8f, 0.3f, 1.0f), "%s", traceState.status.c_str());
+            if (traceState.hookInstallTotal > 0)
+            {
+                const float progress =
+                    static_cast<float>(traceState.hookInstallDone) / static_cast<float>(traceState.hookInstallTotal);
+                ImGui::ProgressBar(progress, ImVec2(-1, 0),
+                                   (std::to_string(traceState.hookInstallDone) + "/" +
+                                    std::to_string(traceState.hookInstallTotal) + " hooks")
+                                       .c_str());
+            }
+            ImGui::TextDisabled("Large libs install hooks in batches — PC sampler runs meanwhile.");
         }
         else if (traceState.active && traceState.base == module.base && traceState.moduleName == module.name)
         {
@@ -1018,9 +1028,10 @@ namespace SoMonitor
                 traceState.threadCount, traceState.hookedCount, traceState.interceptorCount, traceState.dobbyCount,
                 traceState.insnSlots, traceState.totalExecutions, traceState.hookHits, traceState.sampleHits,
                 traceState.sampleRounds);
+            if (traceState.hookCap > 0)
+                ImGui::TextDisabled("Hook cap for this lib size: %zu", traceState.hookCap);
             if (traceState.hookFailed > 0)
                 ImGui::TextDisabled("%zu hook installs failed (cap or unsupported insn)", traceState.hookFailed);
-            if (traceState.totalExecutions == 0 && traceState.sampleRounds > 100)
                 ImGui::TextColored(ImVec4(1.0f, 0.5f, 0.3f, 1.0f),
                                    "0 hits — play the game, or use Hook this offset on a known function.");
             else if (traceState.sampleRounds == 0)
@@ -1036,7 +1047,7 @@ namespace SoMonitor
         }
 
         ImGui::TextDisabled(
-            "Call hooks = exact entry hits (exports/BL/prologue). PC sampler = hot instruction lines between calls.");
+            "Large libs (6–10 MB): lazy mode, batched hooks, capped count. PC sampler = hot insn lines.");
         ImGui::Separator();
 
         static bool hideZeroHits = true;
