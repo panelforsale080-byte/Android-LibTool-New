@@ -76,6 +76,20 @@ namespace
 
     thread_local bool t_inHook = false;
 
+    static inline unsigned symType(unsigned char info) { return info & 0xf; }
+
+    static bool inExecRange(uint64_t address)
+    {
+        for (const SoTraceExecRange &range : g_module.execRanges)
+        {
+            if (address >= range.begin && address < range.end)
+                return true;
+        }
+        return false;
+    }
+
+    static void incrementHit(uint64_t offset);
+
     class NativeEntryListener : public Gum::InvocationListener
     {
       public:
@@ -97,20 +111,6 @@ namespace
 
         void on_leave(Gum::InvocationContext * /*context*/) override {}
     };
-
-    static inline unsigned symType(unsigned char info) { return info & 0xf; }
-
-    static bool inExecRange(uint64_t address)
-    {
-        for (const SoTraceExecRange &range : g_module.execRanges)
-        {
-            if (address >= range.begin && address < range.end)
-                return true;
-        }
-        return false;
-    }
-
-    static void incrementHit(uint64_t offset);
 
     static std::vector<FileExecSegment> loadExecSegmentsFromFile(const SoTraceModule &module)
     {
