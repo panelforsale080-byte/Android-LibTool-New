@@ -38,6 +38,14 @@ static bool g_initialized = false;
 static bool g_DoLog = true;
 static std::string g_runtimeLibraryName;
 
+static void *resolveIl2cppSymbol(void *handle, const char *name)
+{
+    void *sym = xdl_sym(handle, name, nullptr);
+    if (!sym)
+        sym = xdl_dsym(handle, name, nullptr);
+    return sym;
+}
+
 static bool moduleExportsIl2cppApi(const char *libraryName)
 {
     if (!libraryName || !libraryName[0])
@@ -47,12 +55,12 @@ static bool moduleExportsIl2cppApi(const char *libraryName)
     if (!handle)
         return false;
 
-    void *sym = xdl_sym(handle, "il2cpp_domain_get", nullptr);
+    void *sym = resolveIl2cppSymbol(handle, "il2cpp_domain_get");
     xdl_close(handle);
     return sym != nullptr;
 }
 
-static std::string basenameFromMapsPath(const char *line)
+static std::string soPathFromMapsLine(const char *line)
 {
     const char *path = std::strchr(line, '/');
     if (!path)
@@ -63,13 +71,34 @@ static std::string basenameFromMapsPath(const char *line)
         return {};
 
     std::string full(path, static_cast<size_t>(so - path) + 3);
-    const auto slash = full.find_last_of('/');
-    if (slash == std::string::npos)
-        return full;
-    return full.substr(slash + 1);
+    while (!full.empty() && (full.back() == '\n' || full.back() == '\r' || full.back() == ' '))
+        full.pop_back();
+    return full;
 }
 
-static std::vector<std::string> loadedAppLibraryNames()
+static std::string basenameOf(const std::string &path)
+{
+    const auto slash = path.find_last_of('/');
+    if (slash == std::string::npos)
+        return path;
+    return path.substr(slash + 1);
+}
+
+static bool isSkippedLibrary(const std::string &path)
+{
+    const std::string name = basenameOf(path);
+    if (name == "libTool.so" || name == "libdobby.so")
+        return true;
+    if (path.find("/system/") != std::string::npos)
+        return true;
+    if (path.find("/apex/") != std::string::npos)
+        return true;
+    if (path.find("/vendor/") != std::string::npos)
+        return true;
+    return false;
+}
+
+static std::vector<std::string> loadedAppLibraries()
 {
     std::set<std::string> unique;
     FILE *maps = std::fopen("/proc/self/maps", "r");
@@ -81,13 +110,24 @@ static std::vector<std::string> loadedAppLibraryNames()
     {
         if (!std::strstr(line, ".so"))
             continue;
-        if (!std::strstr(line, "/data/app/") && !std::strstr(line, "/data/data/"))
+
+        std::string path = soPathFromMapsLine(line);
+        if (path.empty() || isSkippedLibrary(path))
             continue;
 
-        std::string name = basenameFromMapsPath(line);
-        if (name.empty() || name == "libTool.so")
+        const bool inAppDir = path.find("/data/app/") != std::string::npos ||
+                              path.find("/data/data/") != std::string::npos ||
+                              path.find("/data/user/") != std::string::npos;
+        const std::string name = basenameOf(path);
+        const bool knownName = name.find("il2cpp") != std::string::npos ||
+                               name.find("logic") != std::string::npos ||
+                               name.find("csharp") != std::string::npos ||
+                               name.find("GameAssembly") != std::string::npos;
+        if (!inAppDir && !knownName)
             continue;
-        unique.insert(std::move(name));
+
+        unique.insert(path);
+        unique.insert(name);
     }
     std::fclose(maps);
     return std::vector<std::string>(unique.begin(), unique.end());
@@ -97,6 +137,16 @@ static std::string detectRuntimeLibraryName()
 {
     if (!g_runtimeLibraryName.empty())
         return g_runtimeLibraryName;
+
+    if (void *global = dlsym(RTLD_DEFAULT, "il2cpp_domain_get"))
+    {
+        Dl_info info{};
+        if (dladdr(global, &info) && info.dli_fname && info.dli_fname[0])
+        {
+            g_runtimeLibraryName = basenameOf(info.dli_fname);
+            return g_runtimeLibraryName;
+        }
+    }
 
     const char *known[] = {
         (const char *)targetLibName,
@@ -115,11 +165,11 @@ static std::string detectRuntimeLibraryName()
         }
     }
 
-    for (const auto &name : loadedAppLibraryNames())
+    for (const auto &name : loadedAppLibraries())
     {
         if (moduleExportsIl2cppApi(name.c_str()))
         {
-            g_runtimeLibraryName = name;
+            g_runtimeLibraryName = basenameOf(name);
             return g_runtimeLibraryName;
         }
     }
@@ -130,7 +180,7 @@ static std::string detectRuntimeLibraryName()
 void init_il2cpp_api(void *handle){
 #define DO_API(r, n, p)                                                                                                \
     {                                                                                                                  \
-        n = (r(*) p)xdl_sym(handle, #n, nullptr);                                                                      \
+        n = (r(*) p)resolveIl2cppSymbol(handle, #n);                                                                   \
     }
 
 #include "il2cpp-api-functions.h"
@@ -610,7 +660,7 @@ namespace Il2cpp
         init_il2cpp_api(handle);
 
         // Get base address
-        void *sym = xdl_sym(handle, "il2cpp_domain_get", nullptr);
+        void *sym = resolveIl2cppSymbol(handle, "il2cpp_domain_get");
         if (sym) {
             Dl_info info;
             if (dladdr(sym, &info)) {
