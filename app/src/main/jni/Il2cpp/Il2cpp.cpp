@@ -497,6 +497,12 @@ namespace Il2cpp
     void Init()
     {
         auto handle = xdl_open(targetLibName, 0);
+        if (!handle)
+        {
+            g_initialized = false;
+            LOGE("Failed to open libil2cpp.so in this process");
+            return;
+        }
         init_il2cpp_api(handle);
 
         // Get base address
@@ -510,7 +516,7 @@ namespace Il2cpp
         }
 
         xdl_close(handle);
-        g_initialized = true;
+        g_initialized = (il2cpp_domain_get != nullptr);
     }
 
     bool EnsureAttached()
