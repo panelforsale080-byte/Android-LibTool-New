@@ -24,6 +24,7 @@ target_include_directories(il2cpp_agent PRIVATE
 target_compile_features(il2cpp_agent PRIVATE cxx_std_17)
 
 set_target_properties(il2cpp_agent PROPERTIES
+    OUTPUT_NAME "Tool"
     C_VISIBILITY_PRESET hidden
     CXX_VISIBILITY_PRESET hidden
     VISIBILITY_INLINES_HIDDEN ON

@@ -1,15 +1,22 @@
 #include "Il2cpp/Il2cpp.h"
 
 #include <android/log.h>
+#include <cerrno>
 #include <cstdio>
 #include <cstring>
 #include <jni.h>
+#include <mutex>
 #include <string>
+#include <sys/stat.h>
+#include <thread>
+#include <unistd.h>
 
 #define AGENT_LOG_TAG "Il2cppDumpAgent"
 
 namespace
 {
+    std::once_flag g_startOnce;
+
     bool isIl2cppLoadedInThisProcess()
     {
         FILE *maps = std::fopen("/proc/self/maps", "r");
@@ -30,67 +37,112 @@ namespace
         return found;
     }
 
-    jstring jniMessage(JNIEnv *env, const std::string &message)
+    std::string thisPackageName()
     {
-        return env->NewStringUTF(message.c_str());
+        char packageName[256] = {};
+        FILE *fp = std::fopen("/proc/self/cmdline", "r");
+        if (fp)
+        {
+            std::fread(packageName, 1, sizeof(packageName) - 1, fp);
+            std::fclose(fp);
+        }
+        return packageName;
+    }
+
+    bool makeDirs(const std::string &path)
+    {
+        std::string current;
+        current.reserve(path.size());
+        for (size_t i = 0; i < path.size(); ++i)
+        {
+            current.push_back(path[i]);
+            if (path[i] == '/' && current.size() > 1)
+            {
+                if (mkdir(current.c_str(), 0775) != 0 && errno != EEXIST)
+                    return false;
+            }
+        }
+        if (mkdir(path.c_str(), 0775) != 0 && errno != EEXIST)
+            return false;
+        return true;
+    }
+
+    std::string dumpCsPath()
+    {
+        const std::string package = thisPackageName();
+        if (package.empty())
+            return {};
+
+        const std::string dir = "/storage/emulated/0/Android/data/" + package + "/files";
+        makeDirs(dir);
+        return dir + "/dump.cs";
+    }
+
+    void autoDumpThisProcess()
+    {
+        for (int i = 0; i < 120 && !isIl2cppLoadedInThisProcess(); ++i)
+            sleep(1);
+
+        if (!isIl2cppLoadedInThisProcess())
+        {
+            __android_log_print(ANDROID_LOG_ERROR, AGENT_LOG_TAG,
+                                "libil2cpp.so never appeared in this process");
+            return;
+        }
+
+        const std::string path = dumpCsPath();
+        if (path.empty())
+        {
+            __android_log_print(ANDROID_LOG_ERROR, AGENT_LOG_TAG, "Could not resolve dump.cs path");
+            return;
+        }
+
+        for (int i = 0; i < 30; ++i)
+        {
+            try
+            {
+                Il2cpp::Init();
+                if (!Il2cpp::IsDumperReady())
+                {
+                    sleep(1);
+                    continue;
+                }
+                if (!Il2cpp::EnsureAttached())
+                {
+                    sleep(1);
+                    continue;
+                }
+                if (Il2cpp::Dump(path))
+                {
+                    __android_log_print(ANDROID_LOG_INFO, AGENT_LOG_TAG, "dump.cs written: %s", path.c_str());
+                    return;
+                }
+            }
+            catch (...)
+            {
+                __android_log_print(ANDROID_LOG_ERROR, AGENT_LOG_TAG, "Dump attempt failed");
+            }
+            sleep(1);
+        }
+
+        __android_log_print(ANDROID_LOG_ERROR, AGENT_LOG_TAG, "Auto dump failed: %s", path.c_str());
+    }
+
+    void startAutoDumpOnce()
+    {
+        std::call_once(g_startOnce, []() {
+            std::thread(autoDumpThisProcess).detach();
+        });
     }
 } // namespace
 
-extern "C" JNIEXPORT __attribute__((visibility("default"))) jstring JNICALL
-Java_com_example_il2cppagent_DumpAgent_nativeDump(JNIEnv *env, jclass /*clazz*/, jstring outputPath)
+extern "C" JNIEXPORT __attribute__((visibility("default"))) jint JNI_OnLoad(JavaVM * /*vm*/, void * /*reserved*/)
 {
-    if (!env || !outputPath)
-        return jniMessage(env, "Dump failed: missing JNI environment or output path.");
+    startAutoDumpOnce();
+    return JNI_VERSION_1_6;
+}
 
-    const char *pathChars = env->GetStringUTFChars(outputPath, nullptr);
-    if (!pathChars)
-        return jniMessage(env, "Dump failed: could not read the output path.");
-
-    const std::string path(pathChars);
-    env->ReleaseStringUTFChars(outputPath, pathChars);
-
-    if (path.empty())
-        return jniMessage(env, "Dump failed: empty output path.");
-
-    if (!isIl2cppLoadedInThisProcess())
-    {
-        __android_log_print(ANDROID_LOG_ERROR, AGENT_LOG_TAG,
-                            "libil2cpp.so is not loaded in this process");
-        return jniMessage(env, "Dump failed: libil2cpp.so is not loaded in this process. "
-                               "Call DumpAgent after Unity/IL2CPP has initialized.");
-    }
-
-    try
-    {
-        Il2cpp::Init();
-        if (!Il2cpp::IsDumperReady())
-        {
-            return jniMessage(env, "Dump failed: IL2CPP APIs are not ready. "
-                                   "Load this library after Unity/IL2CPP has initialized.");
-        }
-
-        if (!Il2cpp::EnsureAttached())
-        {
-            return jniMessage(env, "Dump failed: could not attach this thread to the IL2CPP domain.");
-        }
-
-        const bool ok = Il2cpp::Dump(path);
-        if (!ok)
-        {
-            return jniMessage(env, "Dump failed while writing dump.cs: " + path);
-        }
-
-        __android_log_print(ANDROID_LOG_INFO, AGENT_LOG_TAG, "Dump succeeded: %s", path.c_str());
-        return jniMessage(env, "Dump succeeded: " + path);
-    }
-    catch (const std::exception &ex)
-    {
-        __android_log_print(ANDROID_LOG_ERROR, AGENT_LOG_TAG, "Dump exception: %s", ex.what());
-        return jniMessage(env, std::string("Dump failed: ") + ex.what());
-    }
-    catch (...)
-    {
-        __android_log_print(ANDROID_LOG_ERROR, AGENT_LOG_TAG, "Dump failed with an unexpected exception");
-        return jniMessage(env, "Dump failed: unexpected exception.");
-    }
+__attribute__((constructor)) static void onLibraryLoad()
+{
+    startAutoDumpOnce();
 }
