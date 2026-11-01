@@ -521,27 +521,44 @@ namespace Il2cpp
 
     bool EnsureAttached()
     {
-        auto curr = il2cpp_thread_current();
-        if (!curr)
+        if (!il2cpp_thread_current || !il2cpp_thread_attach || !il2cpp_domain_get || !il2cpp_is_vm_thread)
         {
-            LOGI("Foreign thread!");
+            LOGE("IL2CPP thread APIs are not resolved");
+            return false;
         }
-        else
+
+        auto curr = il2cpp_thread_current();
+        if (curr)
         {
             LOGI("Already Attached -> %p", curr);
             return true;
         }
-        LOGI("Attaching Thread");
-        auto *thread = il2cpp_thread_attach(il2cpp_domain_get());
-        while (!il2cpp_is_vm_thread(thread))
+
+        auto domain = il2cpp_domain_get();
+        if (!domain)
         {
-            LOGI("Waiting...");
-            sleep(1);
+            LOGE("IL2CPP domain is not ready");
+            return false;
         }
+
+        LOGI("Attaching Thread");
+        auto *thread = il2cpp_thread_attach(domain);
         if (!thread)
         {
             LOGE("Attaching Failed");
             return false;
+        }
+
+        int waits = 0;
+        while (!il2cpp_is_vm_thread(thread))
+        {
+            if (++waits > 60)
+            {
+                LOGE("Timed out waiting for IL2CPP VM thread");
+                return false;
+            }
+            LOGI("Waiting...");
+            sleep(1);
         }
         LOGI("Thread Attached");
         return true;
@@ -1031,6 +1048,20 @@ namespace Il2cpp
 
     bool IsDumperReady() {
         return g_initialized && il2cpp_image_get_class != nullptr;
+    }
+
+    bool IsRuntimeReady()
+    {
+        if (!g_initialized || !il2cpp_domain_get || !il2cpp_domain_get_assemblies)
+            return false;
+
+        auto domain = il2cpp_domain_get();
+        if (!domain)
+            return false;
+
+        size_t size = 0;
+        auto assemblies = il2cpp_domain_get_assemblies(domain, &size);
+        return assemblies != nullptr && size > 0;
     }
 
     std::string getUnityVersion()

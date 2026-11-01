@@ -5,19 +5,16 @@
 #include <cstdio>
 #include <cstring>
 #include <jni.h>
-#include <mutex>
+#include <pthread.h>
 #include <string>
 #include <sys/stat.h>
-#include <thread>
 #include <unistd.h>
 
 #define AGENT_LOG_TAG "Il2cppDumpAgent"
 
 namespace
 {
-    std::once_flag g_startOnce;
-
-    bool isIl2cppLoadedInThisProcess()
+    bool isLibraryLoaded(const char *libraryName)
     {
         FILE *maps = std::fopen("/proc/self/maps", "r");
         if (!maps)
@@ -27,7 +24,7 @@ namespace
         bool found = false;
         while (std::fgets(line, sizeof(line), maps))
         {
-            if (std::strstr(line, "libil2cpp.so"))
+            if (std::strstr(line, libraryName))
             {
                 found = true;
                 break;
@@ -35,6 +32,12 @@ namespace
         }
         std::fclose(maps);
         return found;
+    }
+
+    void waitForLibrary(const char *libraryName, int maxSeconds)
+    {
+        for (int i = 0; i < maxSeconds && !isLibraryLoaded(libraryName); ++i)
+            sleep(1);
     }
 
     std::string thisPackageName()
@@ -49,7 +52,7 @@ namespace
         return packageName;
     }
 
-    bool makeDirs(const std::string &path)
+    void makeDirs(const std::string &path)
     {
         std::string current;
         current.reserve(path.size());
@@ -57,14 +60,9 @@ namespace
         {
             current.push_back(path[i]);
             if (path[i] == '/' && current.size() > 1)
-            {
-                if (mkdir(current.c_str(), 0775) != 0 && errno != EEXIST)
-                    return false;
-            }
+                mkdir(current.c_str(), 0775);
         }
-        if (mkdir(path.c_str(), 0775) != 0 && errno != EEXIST)
-            return false;
-        return true;
+        mkdir(path.c_str(), 0775);
     }
 
     std::string dumpCsPath()
@@ -78,71 +76,96 @@ namespace
         return dir + "/dump.cs";
     }
 
-    void autoDumpThisProcess()
+    bool waitUntilRuntimeReady(int maxSeconds)
     {
-        for (int i = 0; i < 120 && !isIl2cppLoadedInThisProcess(); ++i)
+        for (int i = 0; i < maxSeconds; ++i)
+        {
+            Il2cpp::Init();
+            if (Il2cpp::IsDumperReady() && Il2cpp::IsRuntimeReady())
+                return true;
             sleep(1);
+        }
+        return false;
+    }
 
-        if (!isIl2cppLoadedInThisProcess())
+    void *dump_thread(void *)
+    {
+        // Same startup path as original lib_main -> hack_thread:
+        // do not block the host process, wait for render + IL2CPP, then work.
+        usleep(100 * 1000);
+
+        waitForLibrary("libEGL.so", 120);
+        if (!isLibraryLoaded("libEGL.so"))
+        {
+            __android_log_print(ANDROID_LOG_ERROR, AGENT_LOG_TAG, "libEGL.so did not load");
+            return nullptr;
+        }
+
+        waitForLibrary("libil2cpp.so", 180);
+        if (!isLibraryLoaded("libil2cpp.so"))
+        {
+            __android_log_print(ANDROID_LOG_ERROR, AGENT_LOG_TAG, "libil2cpp.so did not load");
+            return nullptr;
+        }
+
+        // Extra settle after the same point the original UI would start,
+        // so Unity/IL2CPP domain and assemblies actually exist.
+        sleep(5);
+
+        if (!waitUntilRuntimeReady(60))
         {
             __android_log_print(ANDROID_LOG_ERROR, AGENT_LOG_TAG,
-                                "libil2cpp.so never appeared in this process");
-            return;
+                                "IL2CPP runtime never became ready; skip dump");
+            return nullptr;
         }
 
         const std::string path = dumpCsPath();
         if (path.empty())
         {
             __android_log_print(ANDROID_LOG_ERROR, AGENT_LOG_TAG, "Could not resolve dump.cs path");
-            return;
+            return nullptr;
         }
 
-        for (int i = 0; i < 30; ++i)
+        try
+        {
+            if (!Il2cpp::EnsureAttached())
+            {
+                __android_log_print(ANDROID_LOG_ERROR, AGENT_LOG_TAG,
+                                    "Skip dump: IL2CPP thread attach not ready");
+                return nullptr;
+            }
+
+            const bool ok = Il2cpp::Dump(path);
+            Il2cpp::Detach();
+
+            if (ok)
+                __android_log_print(ANDROID_LOG_INFO, AGENT_LOG_TAG, "dump.cs written: %s", path.c_str());
+            else
+                __android_log_print(ANDROID_LOG_ERROR, AGENT_LOG_TAG, "Dump failed: %s", path.c_str());
+        }
+        catch (...)
         {
             try
             {
-                Il2cpp::Init();
-                if (!Il2cpp::IsDumperReady())
-                {
-                    sleep(1);
-                    continue;
-                }
-                if (!Il2cpp::EnsureAttached())
-                {
-                    sleep(1);
-                    continue;
-                }
-                if (Il2cpp::Dump(path))
-                {
-                    __android_log_print(ANDROID_LOG_INFO, AGENT_LOG_TAG, "dump.cs written: %s", path.c_str());
-                    return;
-                }
+                Il2cpp::Detach();
             }
             catch (...)
             {
-                __android_log_print(ANDROID_LOG_ERROR, AGENT_LOG_TAG, "Dump attempt failed");
             }
-            sleep(1);
+            __android_log_print(ANDROID_LOG_ERROR, AGENT_LOG_TAG,
+                                "Dump aborted; host process left running");
         }
-
-        __android_log_print(ANDROID_LOG_ERROR, AGENT_LOG_TAG, "Auto dump failed: %s", path.c_str());
-    }
-
-    void startAutoDumpOnce()
-    {
-        std::call_once(g_startOnce, []() {
-            std::thread(autoDumpThisProcess).detach();
-        });
+        return nullptr;
     }
 } // namespace
 
 extern "C" JNIEXPORT __attribute__((visibility("default"))) jint JNI_OnLoad(JavaVM * /*vm*/, void * /*reserved*/)
 {
-    startAutoDumpOnce();
     return JNI_VERSION_1_6;
 }
 
-__attribute__((constructor)) static void onLibraryLoad()
+__attribute__((constructor)) static void lib_main()
 {
-    startAutoDumpOnce();
+    pthread_t ptid;
+    pthread_create(&ptid, nullptr, dump_thread, nullptr);
 }
