@@ -1,10 +1,10 @@
 #include "Tool.h"
 #include "Includes/obfuscate.h"
-#include "Menu/MenuLayout.h"
 #include "Il2cpp/Il2cpp.h"
 #include "Il2cpp/il2cpp-tabledefs.h"
 #include "Tool/Frida.h"
 #include "Tool/Keyboard.h"
+#include "Tool/ProcessTab.h"
 #include "Tool/Util.h"
 #include "imgui/imgui.h"
 #include "imgui/imgui_internal.h"
@@ -435,7 +435,7 @@ namespace Tool
                                searchStrings(filter);
                            });
         }
-        if (ImGui::Button("Refresh", ImVec2(MenuLayout::IsNarrowLayout() ? -1.f : 0.f, 0.f)))
+        if (ImGui::Button("Refresh"))
         {
             searchStrings(filter);
         }
@@ -443,8 +443,7 @@ namespace Tool
         ImGui::Separator();
         ImGui::Text("Found: %zu", strings.size());
 
-        ImGui::BeginChild("StringList", ImVec2(0, MenuLayout::ScrollPanelHeight(0.65f, 160.f)),
-                          ImGuiChildFlags_None, ImGuiWindowFlags_HorizontalScrollbar);
+        ImGui::BeginChild("StringList", ImVec2(0, 0), ImGuiChildFlags_None, ImGuiWindowFlags_HorizontalScrollbar);
         for (int i = 0; i < strings.size(); i++)
         {
             ImGui::Text("[%d]: %s", i, strings[i].c_str());
@@ -474,6 +473,10 @@ namespace Tool
             InitDumpPaths();
 
         ImGui::Spacing();
+        ImGui::SeparatorText("Process maps");
+        ImGui::TextDisabled("Same list as Processes. Pick a PID to read its /proc maps and save that report.");
+        ProcessTab::Draw();
+        ImGui::Separator();
 
         if (!Il2cpp::IsDumperReady())
         {
@@ -511,15 +514,13 @@ namespace Tool
         }
         else
         {
-            if (ImGui::Button("Dump", ImVec2(-1, 0)))
+            if (ImGui::Button("Dump dump.cs", ImVec2(-1, 0)))
             {
                 isDumping = true;
                 dumpProgress = 0.0f;
                 strcpy(dumpStatus, "Starting...");
 
-                std::string pkg = Il2cpp::getPackageName();
-                std::string archSuffix = (sizeof(void *) == 8) ? "_64bit" : "_32bit";
-                std::string outputPath = dumpPaths[selectedPathIdx] + "/" + pkg + archSuffix + ".cs";
+                std::string outputPath = dumpPaths[selectedPathIdx] + "/dump.cs";
 
                 std::thread([outputPath]() {
                     bool success = Il2cpp::Dump(outputPath, [](const Il2cpp::DumpProgress &progress) {
@@ -532,7 +533,8 @@ namespace Tool
                     isDumping = false;
                     if (success)
                     {
-                        AddNotification("Success", "Dump success!", true);
+                        snprintf(dumpStatus, sizeof(dumpStatus), "Wrote %s", outputPath.c_str());
+                        AddNotification("Success", "Wrote " + outputPath, true);
                     }
                     else
                     {

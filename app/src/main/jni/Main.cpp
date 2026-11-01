@@ -8,7 +8,6 @@
 #include "Includes/Utils.h"      // for isGameLibLoaded, isLibraryLoaded
 #include "Includes/obfuscate.h"  // for make_obfuscator, OBFUSCATE
 #include "Menu/ImGui.h"
-#include "Menu/MenuLayout.h"
 #include "Tool/Keyboard.h"
 #include "Tool/ProcessTab.h"
 #include "Tool/SoMonitor.h"
@@ -48,7 +47,6 @@ bool fullScreen = false;
 bool resetWindow = false;
 int selectedScale = 3;
 int selectedTheme = 0;
-bool showFpsCounter = true;
 
 bool doChangeScale = false;
 bool doChangeTheme = false;
@@ -88,7 +86,7 @@ static void ApplyAxcelStyle()
     s.GrabRounding = 6.0f;
     s.TabRounding = 6.0f;
     s.WindowBorderSize = 1.0f;
-    s.FrameBorderSize = 0.0f;
+    s.FrameBorderSize = 1.0f;
     s.WindowTitleAlign = ImVec2(0.5f, 0.5f);
 
     if (selectedTheme != 1) // skip recolor on Light theme
@@ -133,8 +131,6 @@ void draw_thread()
 {
     static ImVec2 lastSize = ImVec2(0, 0);
     static ImVec2 lastPos = ImVec2(0, 0);
-
-    MenuLayout::RequestAutoScale(selectedScale, doChangeScale);
 
     if (resetWindow)
     {
@@ -197,13 +193,7 @@ void draw_thread()
         drawList->AddText(labellPos, color, label);
         i++;
     }
-
-    if (!fullScreen)
-        MenuLayout::ApplyResponsiveMainWindow(false);
-
-    collapsed = !ImGui::Begin(title, nullptr,
-                              (fullScreen ? ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove : 0) |
-                                  ImGuiWindowFlags_NoCollapse);
+    collapsed = !ImGui::Begin(title, nullptr, (fullScreen ? ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove : 0));
     if (fullScreen)
     {
         ImGui::PopStyleVar();
@@ -214,8 +204,7 @@ void draw_thread()
 #endif
     Keyboard::Update();
     static bool changeToToolsTab = false;
-    if (ImGui::BeginTabBar("mainTabber",
-                           ImGuiTabBarFlags_FittingPolicyScroll | ImGuiTabBarFlags_TabListPopupButton))
+    if (ImGui::BeginTabBar("mainTabber"))
     {
         if (ImGui::BeginTabItem("Tools", nullptr, changeToToolsTab ? ImGuiTabItemFlags_SetSelected : 0))
         {
@@ -252,8 +241,7 @@ void draw_thread()
                     }
                     std::sort(sortedHooker.begin(), sortedHooker.end(),
                               [](const HookerData *a, const HookerData *b) { return a->hitCount > b->hitCount; });
-                    ImGui::BeginChild("TracerList", ImVec2(0, MenuLayout::ScrollPanelHeight(0.72f, 180.f)),
-                                      ImGuiChildFlags_None,
+                    ImGui::BeginChild("TracerList", ImVec2(0, 0), ImGuiChildFlags_None,
                                       ImGuiWindowFlags_HorizontalScrollbar);
                     auto &tab = Tool::GetFirstTab();
                     for (auto v : sortedHooker)
@@ -360,18 +348,6 @@ void draw_thread()
                 ImGui::EndCombo();
             }
             ImGui::Checkbox("Enable if keyboard input is not being received", &Keyboard::check);
-            if (ImGui::Checkbox("Show FPS counter", &showFpsCounter))
-            {
-                ConfigSet("showFpsCounter", showFpsCounter);
-                MenuLayout::SetFpsVisible(showFpsCounter);
-            }
-            if (ImGui::Button("Auto-fit UI to screen", ImVec2(-1, 0)))
-            {
-                selectedScale = MenuLayout::RecommendedScaleIndex(ImGui::GetIO().DisplaySize.x,
-                                                                  ImGui::GetIO().DisplaySize.y);
-                ConfigSet("selectedScale", selectedScale);
-                doChangeScale = true;
-            }
 #ifdef __DEBUG__
             if (ImGui::Checkbox("Show Demo Window", &showDemoWindow))
             {
@@ -379,7 +355,7 @@ void draw_thread()
 #endif
             ImGui::TextColored(ImVec4(0.10f, 0.65f, 0.95f, 1.0f), "Info");
             ImGui::Separator();
-            ImGui::Text("Menu: Axcel Modified tools v3.3");
+            ImGui::Text("Menu: Axcel Modified tools v3.2");
             static auto packageName = Il2cpp::getPackageName();
             static auto unityVersion = Il2cpp::getUnityVersion();
             static auto gameVersion = Il2cpp::getGameVersion();
@@ -471,7 +447,7 @@ void draw_thread()
     }
 #endif
     ImGui::Separator();
-    ImGui::TextDisabled("Axcel Modified tools  •  v3.3");
+    ImGui::TextDisabled("Axcel Modified tools");
     ImGui::End();
     Tool::DrawNotifications();
 }
@@ -558,8 +534,6 @@ void on_init()
         selectedTheme = 0;
         ConfigSet("selectedTheme", selectedTheme);
     }
-    showFpsCounter = ConfigGet<bool>("showFpsCounter", true);
-    MenuLayout::SetFpsVisible(showFpsCounter);
     doChangeTheme = true;
     doChangeScale = true;
 

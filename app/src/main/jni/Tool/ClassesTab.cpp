@@ -1,6 +1,4 @@
 #include "ClassesTab.h"
-#include "Menu/MenuLayout.h"
-#include <algorithm>
 #include <algorithm>
 #include "Il2cpp/Il2cpp.h"
 #include "Tool/Keyboard.h"
@@ -162,12 +160,13 @@ void ClassesTab::ImGuiObjectSelector(int id, Il2CppClass *klass, const char *pre
     }
     ImGui::PopID();
     ImGuiIO &io = ImGui::GetIO();
-    const float panelMaxH = MenuLayout::ScrollPanelHeight(0.35f, 120.f);
+    float width = io.DisplaySize.x;
+    float height = io.DisplaySize.y;
     // FIXME: DRY!!
     {
         auto &objects = objectMap[klass];
-        ImGui::SetNextWindowSizeConstraints(ImVec2(-1, 0), ImVec2(-1, panelMaxH));
-        ImGui::BeginChild("##ScrollingObjects", ImVec2(-1, 0), ImGuiChildFlags_AutoResizeY);
+        ImGui::SetNextWindowSizeConstraints(ImVec2(-1, 0), ImVec2(-1, height / 3));
+        ImGui::BeginChild("##ScrollingObjects", ImVec2(width / 1.4f, 0), ImGuiChildFlags_AutoResizeY);
         {
             ImGui::SeparatorText("Result Object");
             if (objects.empty())
@@ -251,8 +250,8 @@ void ClassesTab::ImGuiObjectSelector(int id, Il2CppClass *klass, const char *pre
         sprintf(buffer, "Inherited from %s", klass->getName());
         if (ImGui::CollapsingHeader(buffer))
         {
-            ImGui::SetNextWindowSizeConstraints(ImVec2(-1, 0), ImVec2(-1, panelMaxH));
-            ImGui::BeginChild("##ScrollingInheritedObjects", ImVec2(-1, 0), ImGuiChildFlags_AutoResizeY);
+            ImGui::SetNextWindowSizeConstraints(ImVec2(-1, 0), ImVec2(-1, height / 3));
+            ImGui::BeginChild("##ScrollingInheritedObjects", ImVec2(width / 1.4f, 0), ImGuiChildFlags_AutoResizeY);
             {
                 // {
                 //     char buffer[128];
@@ -330,8 +329,8 @@ void ClassesTab::ImGuiObjectSelector(int id, Il2CppClass *klass, const char *pre
         if (ImGui::CollapsingHeader("Saved Objects"))
         {
             auto &objects = savedSet[klass];
-            ImGui::SetNextWindowSizeConstraints(ImVec2(-1, 0), ImVec2(-1, panelMaxH));
-            ImGui::BeginChild("##ScrollingSavedObjects", ImVec2(-1, 0), ImGuiChildFlags_AutoResizeY);
+            ImGui::SetNextWindowSizeConstraints(ImVec2(-1, 0), ImVec2(-1, height / 3));
+            ImGui::BeginChild("##ScrollingSavedObjects", ImVec2(width / 1.4f, 0), ImGuiChildFlags_AutoResizeY);
             {
                 // ImGui::SeparatorText("Saved Objects");
                 if (objects.empty())
@@ -398,8 +397,8 @@ void ClassesTab::ImGuiObjectSelector(int id, Il2CppClass *klass, const char *pre
         if (ImGui::CollapsingHeader("Collected Objects"))
         {
             auto &objects = HookerData::collectSet[klass];
-            ImGui::SetNextWindowSizeConstraints(ImVec2(-1, 0), ImVec2(-1, panelMaxH));
-            ImGui::BeginChild("##ScrollingCollectedObjects", ImVec2(-1, 0), ImGuiChildFlags_AutoResizeY);
+            ImGui::SetNextWindowSizeConstraints(ImVec2(-1, 0), ImVec2(-1, height / 3));
+            ImGui::BeginChild("##ScrollingCollectedObjects", ImVec2(width / 1.4f, 0), ImGuiChildFlags_AutoResizeY);
             {
                 // ImGui::SeparatorText("Collected Objects");
                 if (objects.empty())
@@ -473,8 +472,8 @@ void ClassesTab::ImGuiObjectSelector(int id, Il2CppClass *klass, const char *pre
         if (ImGui::CollapsingHeader("Created Objects"))
         {
             auto &objects = newObjectMap[klass];
-            ImGui::SetNextWindowSizeConstraints(ImVec2(-1, 0), ImVec2(-1, panelMaxH));
-            ImGui::BeginChild("##ScrollingNewObjects", ImVec2(-1, 0), ImGuiChildFlags_AutoResizeY);
+            ImGui::SetNextWindowSizeConstraints(ImVec2(-1, 0), ImVec2(-1, height / 3));
+            ImGui::BeginChild("##ScrollingNewObjects", ImVec2(width / 1.4f, 0), ImGuiChildFlags_AutoResizeY);
             {
                 // ImGui::SeparatorText("Created Objects");
                 if (objects.empty())
@@ -2698,9 +2697,8 @@ void ClassesTab::ImGuiJson(Il2CppObject *rootObj)
         }
 
         static ImGuiIO &io = ImGui::GetIO();
-        const float popupW = std::min(MenuLayout::ContentWidth(), io.DisplaySize.x * 0.96f);
-        ImGui::SetNextWindowSizeConstraints(ImVec2(popupW, 0),
-                                            ImVec2(popupW, io.DisplaySize.y * 0.72f));
+        ImGui::SetNextWindowSizeConstraints(ImVec2(io.DisplaySize.x / 1.2f, 0),
+                                            ImVec2(io.DisplaySize.x / 1.2f, io.DisplaySize.y / 2));
         if (ImGui::BeginPopup("MethodPopup", ImGuiWindowFlags_HorizontalScrollbar))
         {
             auto text = currentObj->klass->getName();

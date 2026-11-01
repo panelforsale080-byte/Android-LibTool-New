@@ -1,5 +1,5 @@
+
 #include "ImGui.h"
-#include "Menu/MenuLayout.h"
 #include "KittyMemory/KittyMemory.h"
 #include "Dobby/include/dobby.h"
 #include "Includes/Utils.h"
@@ -13,7 +13,6 @@
 #include <GLES3/gl3.h>
 #include <string>
 #include <unistd.h>
-#include <algorithm>
 #include "EGL/egl.h"
 
 using swapbuffers_orig = EGLBoolean (*)(EGLDisplay dpy, EGLSurface surf);
@@ -189,6 +188,8 @@ void setupMenu()
     io.DisplaySize = ImVec2((float)glWidth, (float)glHeight);
     // io.ConfigWindowsMoveFromTitleBarOnly = true;
     io.IniFilename = nullptr;
+    // enable docking
+    io.ConfigFlags |= ImGuiConfigFlags_DockingEnable;
     io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
 
     io.SetClipboardTextFn = SetClipboardText;
@@ -198,18 +199,17 @@ void setupMenu()
     ImGui_ImplAndroid_Init(g_AppWindow);
     ImGui_ImplOpenGL3_Init("#version 300 es");
 
-    const float shortSide = (glWidth > 0 && glHeight > 0)
-                                ? (float)std::min(glWidth, glHeight)
-                                : 720.f;
-    const float fontPx = std::max(18.f, std::min(shortSide * 0.028f, 26.f));
-    const float uiScale = std::max(0.85f, std::min(shortSide / 720.f, 1.25f));
-    io.Fonts->AddFontFromMemoryTTF(Roboto_Regular, sizeof(Roboto_Regular), fontPx);
+    // int systemScale = (1.0 / glWidth) * glWidth;
+    // ImFontConfig font_cfg;
+    // font_cfg.SizePixels = systemScale * 22.0f;
+    // Smaller but readable font (was 40); the per-level scale presets in
+    // Settings let the user adjust further.
+    io.Fonts->AddFontFromMemoryTTF(Roboto_Regular, sizeof(Roboto_Regular), 32.0f);
 
-    ImGui::GetStyle().ScaleAllSizes(uiScale);
+    ImGui::GetStyle().ScaleAllSizes(1.6f);
     ImGuiStyle &style = ImGui::GetStyle();
-    style.ScrollbarSize = std::max(style.ScrollbarSize, 14.f);
+    style.ScrollbarSize *= 1.8f;
     style.WindowTitleAlign = ImVec2(0.5f, 0.5f);
-    style.TouchExtraPadding = ImVec2(4.f, 4.f);
 
     if (onInitAddr)
         onInitAddr();
@@ -258,8 +258,7 @@ void internalDrawMenu(int width, int height)
     ImGui_ImplAndroid_NewFrame(width, height);
     ImGui::NewFrame();
 
-    MenuLayout::OnFrame(width, height);
-    MenuLayout::DrawFpsOverlay();
+    ImGui::SetNextWindowSize(ImVec2((float)width / 2, (float)height / 2), ImGuiCond_Once);
     menuAddress();
 
     ImGui::Render();

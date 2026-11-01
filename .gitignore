@@ -87,7 +87,6 @@ lint/tmp/
 # Android Profiling
 *.hprof
 
-# NDK build outputs (regenerated on build)
+# Native object files and local NDK output
+obj/
 app/src/main/obj/
-app/src/main/libs/
-app/build/

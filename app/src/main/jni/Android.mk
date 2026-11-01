@@ -50,11 +50,9 @@ LOCAL_STATIC_LIBRARIES := asmjit dobby frida_gum
 LOCAL_SRC_FILES := \
     Main.cpp \
     Menu/ImGui.cpp \
-    Menu/MenuLayout.cpp \
     Tool/Keyboard.cpp \
     Tool/ProcessTab.cpp \
     Tool/SoMonitor.cpp \
-    Tool/SoMonitorTrace.cpp \
     Tool/Tool.cpp \
     Tool/Util.cpp \
     Tool/Patcher.cpp \

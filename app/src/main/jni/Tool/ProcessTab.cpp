@@ -1,7 +1,10 @@
 #include "Tool/ProcessTab.h"
 
-#include "Menu/MenuLayout.h"
+#include "Il2cpp/Il2cpp.h"
+#include "Tool/Tool.h"
 #include "imgui/imgui.h"
+
+#include <thread>
 
 #include <algorithm>
 #include <cerrno>
@@ -16,6 +19,7 @@
 #include <limits>
 #include <sstream>
 #include <string>
+#include <sys/stat.h>
 #include <vector>
 #include <unistd.h>
 
@@ -308,6 +312,60 @@ namespace
         std::snprintf(buffer, sizeof(buffer), "0x%llX", static_cast<unsigned long long>(value));
         return buffer;
     }
+
+    std::string selfPackageName()
+    {
+        std::string name = executableName(readFileLine("/proc/self/cmdline"));
+        return name.empty() ? std::string("app") : name;
+    }
+
+    bool ensureDirectory(const std::string &path)
+    {
+        if (path.empty())
+            return false;
+        std::string current;
+        for (size_t i = 0; i < path.size(); ++i)
+        {
+            current.push_back(path[i]);
+            if (path[i] != '/' || current.size() <= 1)
+                continue;
+            if (mkdir(current.c_str(), 0770) != 0 && errno != EEXIST)
+                return false;
+        }
+        if (mkdir(path.c_str(), 0770) != 0 && errno != EEXIST)
+            return false;
+        return true;
+    }
+
+    std::string saveMapsReport(int pid, const std::string &processName, const std::vector<MappingInfo> &mappings,
+                               const std::string &mapsError)
+    {
+        const std::string directory = "/sdcard/Android/data/" + selfPackageName() + "/files";
+        if (!ensureDirectory(directory))
+            return "Cannot create " + directory;
+
+        const std::string path = directory + "/process-" + std::to_string(pid) + "-maps.txt";
+        FILE *file = std::fopen(path.c_str(), "w");
+        if (!file)
+            return std::string("Cannot write ") + path + ": " + std::strerror(errno);
+
+        std::fprintf(file, "process: %s\n", processName.c_str());
+        std::fprintf(file, "pid: %d\n", pid);
+        std::fprintf(file, "source: /proc/%d/maps\n", pid);
+        std::fprintf(file, "note: library path, range, file offset, and permissions only\n");
+        if (!mapsError.empty())
+            std::fprintf(file, "status: %s\n", mapsError.c_str());
+        std::fprintf(file, "\nlibrary\tstart\tend\toffset\tperms\n");
+        for (const MappingInfo &mapping : mappings)
+        {
+            const uint64_t base = moduleBase(mappings, mapping.path);
+            const uint64_t offset = base == 0 ? 0 : mapping.start - base;
+            std::fprintf(file, "%s\t%s\t%s\t%s\t%s\n", mapping.path.c_str(), address(mapping.start).c_str(),
+                         address(mapping.end).c_str(), address(offset).c_str(), mapping.permissions.c_str());
+        }
+        std::fclose(file);
+        return "Saved " + path + " (" + std::to_string(mappings.size()) + " .so regions)";
+    }
 } // namespace
 
 namespace ProcessTab
@@ -324,11 +382,90 @@ namespace ProcessTab
         static std::string selectedProcess;
         static std::vector<MappingInfo> selectedMappings;
         static std::string mapsError;
+        static std::string saveStatus;
+        static char manualPidInput[32] = {};
+        static std::string manualPidStatus;
+        static bool isDumping = false;
+        static float dumpProgress = 0.0f;
+        static char dumpStatus[256] = "Ready";
+        static char currentAssembly[128] = "";
+
+        auto startOwnDump = [&]() -> bool {
+            if (isDumping || !Il2cpp::IsDumperReady())
+                return false;
+
+            isDumping = true;
+            dumpProgress = 0.0f;
+            std::snprintf(dumpStatus, sizeof(dumpStatus), "Starting...");
+            const std::string directory = "/sdcard/Android/data/" + selfPackageName() + "/files";
+            ensureDirectory(directory);
+            const std::string outputPath = directory + "/dump.cs";
+            std::thread([outputPath]() {
+                const bool success = Il2cpp::Dump(outputPath, [](const Il2cpp::DumpProgress &progress) {
+                    dumpProgress = progress.progress;
+                    std::snprintf(dumpStatus, sizeof(dumpStatus), "Processing: %d/%d classes",
+                                  progress.currentClassIndex, progress.totalClasses);
+                    std::strncpy(currentAssembly, progress.currentAssembly.c_str(), sizeof(currentAssembly) - 1);
+                    currentAssembly[sizeof(currentAssembly) - 1] = '\0';
+                });
+                isDumping = false;
+                if (success)
+                {
+                    std::snprintf(dumpStatus, sizeof(dumpStatus), "Wrote %s", outputPath.c_str());
+                    Tool::AddNotification("Success", "Wrote " + outputPath, true);
+                }
+                else
+                {
+                    std::snprintf(dumpStatus, sizeof(dumpStatus), "Dump failed");
+                    Tool::AddNotification("Failed", "Dump failed!", false);
+                }
+            }).detach();
+            manualPidStatus = "Dump started.";
+            return true;
+        };
+
+        auto selectPid = [&](int pid) {
+            selectedPid = pid;
+            selectedProcess.clear();
+            for (const ProcessInfo &process : processes)
+            {
+                if (process.pid == pid)
+                {
+                    selectedProcess = process.name;
+                    break;
+                }
+            }
+            if (selectedProcess.empty())
+            {
+                const std::string processPath = std::string("/proc/") + std::to_string(pid);
+                selectedProcess = executableName(readFileLine(processPath + "/cmdline"));
+                if (selectedProcess.empty())
+                    selectedProcess = readFileLine(processPath + "/comm");
+                if (selectedProcess.empty())
+                    selectedProcess = "pid-" + std::to_string(pid);
+            }
+
+            selectedMappings.clear();
+            const MapsScanResult scan = scanSharedLibraries(selectedPid);
+            mapsError = scan.error;
+            if (scan.readable)
+                selectedMappings = scan.mappings;
+            else
+                selectedMappings.clear();
+
+            if (selectedPid == getpid())
+                manualPidStatus = "Own PID selected. Press Dump dump.cs to dump.";
+            else
+                manualPidStatus = "Other PID selected — maps/report only.";
+        };
 
         if (!hasScanned)
         {
             processes = scanProcesses(unreadableCount);
             hasScanned = true;
+            std::snprintf(manualPidInput, sizeof(manualPidInput), "%d", getpid());
+            selectedPid = getpid();
+            selectedProcess = selfPackageName() + "  (this process)";
         }
 
         if (autoRefresh)
@@ -344,35 +481,46 @@ namespace ProcessTab
 
         if (ImGui::Button("Refresh##processes"))
             processes = scanProcesses(unreadableCount);
-        if (!MenuLayout::IsNarrowLayout())
-        {
-            ImGui::SameLine();
-            ImGui::Checkbox("Auto refresh##processes", &autoRefresh);
-            ImGui::SameLine();
-            ImGui::Text("%zu visible processes", processes.size());
-        }
-        else
-        {
-            ImGui::Checkbox("Auto refresh##processes", &autoRefresh);
-            ImGui::Text("%zu visible processes", processes.size());
-        }
+        ImGui::SameLine();
+        ImGui::Checkbox("Auto refresh##processes", &autoRefresh);
+        ImGui::SameLine();
+        ImGui::Text("%zu visible processes", processes.size());
 
         ImGui::InputText("Filter##processes", filter, sizeof(filter));
         ImGui::TextDisabled("Only .so files under /data/app/ are included. Select a process to inspect mappings.");
+        ImGui::Separator();
+        ImGui::Text("Manual PID");
+        ImGui::SetNextItemWidth(160.0f);
+        ImGui::InputText("##manualPid", manualPidInput, sizeof(manualPidInput),
+                         ImGuiInputTextFlags_CharsDecimal);
+        ImGui::SameLine();
+        if (ImGui::Button("Use PID##manual"))
+        {
+            const int pid = std::atoi(manualPidInput);
+            if (pid <= 0)
+                manualPidStatus = "Enter a valid PID.";
+            else
+                selectPid(pid);
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Use this PID##manualSelf"))
+        {
+            std::snprintf(manualPidInput, sizeof(manualPidInput), "%d", getpid());
+            selectPid(getpid());
+        }
+        ImGui::TextDisabled("Dump only runs in this process (%d). No auto dump — press Dump dump.cs.", getpid());
+        if (!manualPidStatus.empty())
+            ImGui::TextWrapped("%s", manualPidStatus.c_str());
         if (unreadableCount > 0)
             ImGui::TextColored(ImVec4(1.0f, 0.7f, 0.25f, 1.0f),
                                "%zu process entries could not be read due to host permissions.", unreadableCount);
         ImGui::Separator();
 
-        const float processTableH = selectedPid >= 0
-                                        ? MenuLayout::ScrollPanelHeight(0.38f, 140.f)
-                                        : MenuLayout::ScrollPanelHeight(0.72f, 180.f);
         if (ImGui::BeginTable("ProcessList", 2,
                               ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY,
-                              ImVec2(0, processTableH)))
+                              ImVec2(0, selectedPid >= 0 ? ImGui::GetContentRegionAvail().y * 0.42f : 0)))
         {
-            ImGui::TableSetupColumn("PID", ImGuiTableColumnFlags_WidthFixed,
-                                    MenuLayout::IsNarrowLayout() ? 64.0f : 90.0f);
+            ImGui::TableSetupColumn("PID", ImGuiTableColumnFlags_WidthFixed, 90.0f);
             ImGui::TableSetupColumn("Process name", ImGuiTableColumnFlags_WidthStretch);
             ImGui::TableHeadersRow();
 
@@ -388,18 +536,13 @@ namespace ProcessTab
                 ImGui::TableSetColumnIndex(0);
                 ImGui::Text("%d", process.pid);
                 ImGui::TableSetColumnIndex(1);
-                if (ImGui::Selectable(process.name.c_str(), selectedPid == process.pid,
+                const std::string rowLabel =
+                    process.pid == getpid() ? process.name + "  (this process)" : process.name;
+                if (ImGui::Selectable(rowLabel.c_str(), selectedPid == process.pid,
                                       ImGuiSelectableFlags_SpanAllColumns))
                 {
-                    selectedPid = process.pid;
-                    selectedProcess = process.name;
-                    selectedMappings.clear();
-                    const MapsScanResult scan = scanSharedLibraries(selectedPid);
-                    mapsError = scan.error;
-                    if (scan.readable)
-                        selectedMappings = scan.mappings;
-                    else
-                        selectedMappings.clear();
+                    std::snprintf(manualPidInput, sizeof(manualPidInput), "%d", process.pid);
+                    selectPid(process.pid);
                 }
                 ImGui::PopID();
             }
@@ -428,21 +571,50 @@ namespace ProcessTab
                 selectedMappings.clear();
         }
         ImGui::SameLine();
+        if (ImGui::Button("Save maps report##processes"))
+            saveStatus = saveMapsReport(selectedPid, selectedProcess, selectedMappings, mapsError);
+        ImGui::SameLine();
         ImGui::Text("%zu .so regions", selectedMappings.size());
+        if (!saveStatus.empty())
+            ImGui::TextWrapped("%s", saveStatus.c_str());
+
+        if (selectedPid != getpid())
+        {
+            ImGui::TextDisabled("Dump dump.cs is only available on (this process). Other PIDs are maps/report only.");
+        }
+
+        if (selectedPid == getpid())
+        {
+            ImGui::Separator();
+            if (!Il2cpp::IsDumperReady())
+            {
+                ImGui::TextColored(ImVec4(1.0f, 0.3f, 0.3f, 1.0f), "Il2Cpp not ready in this process.");
+            }
+            else if (isDumping)
+            {
+                ImGui::Button("Dumping...##process", ImVec2(-1, 0));
+                ImGui::ProgressBar(dumpProgress, ImVec2(-1.0f, 0.0f));
+                ImGui::Text("Status: %s", dumpStatus);
+                ImGui::Text("Assembly: %s", currentAssembly);
+            }
+            else if (ImGui::Button("Dump dump.cs##process", ImVec2(-1, 0)))
+            {
+                startOwnDump();
+            }
+            if (std::strcmp(dumpStatus, "Ready") != 0)
+                ImGui::TextWrapped("%s", dumpStatus);
+        }
 
         if (ImGui::CollapsingHeader("Current .so mappings", ImGuiTreeNodeFlags_DefaultOpen))
         {
             if (ImGui::BeginTable("SharedLibraryMappings", 5,
                                   ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY,
-                                  ImVec2(0, MenuLayout::ScrollPanelHeight(0.42f, 150.f))))
+                                  ImVec2(0, 170)))
             {
                 ImGui::TableSetupColumn("Library", ImGuiTableColumnFlags_WidthStretch);
-                ImGui::TableSetupColumn("Start", ImGuiTableColumnFlags_WidthFixed,
-                                        MenuLayout::IsNarrowLayout() ? 96.0f : 130.0f);
-                ImGui::TableSetupColumn("End", ImGuiTableColumnFlags_WidthFixed,
-                                        MenuLayout::IsNarrowLayout() ? 96.0f : 130.0f);
-                ImGui::TableSetupColumn("Offset", ImGuiTableColumnFlags_WidthFixed,
-                                        MenuLayout::IsNarrowLayout() ? 88.0f : 110.0f);
+                ImGui::TableSetupColumn("Start", ImGuiTableColumnFlags_WidthFixed, 130.0f);
+                ImGui::TableSetupColumn("End", ImGuiTableColumnFlags_WidthFixed, 130.0f);
+                ImGui::TableSetupColumn("Offset", ImGuiTableColumnFlags_WidthFixed, 110.0f);
                 ImGui::TableSetupColumn("Perms", ImGuiTableColumnFlags_WidthFixed, 55.0f);
                 ImGui::TableHeadersRow();
 
