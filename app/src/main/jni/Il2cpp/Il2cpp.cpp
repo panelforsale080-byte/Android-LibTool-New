@@ -21,6 +21,7 @@
 #include <codecvt>
 #include <locale>
 #include <algorithm>
+#include <set>
 #include "il2cpp-tabledefs.h"
 #include "il2cpp-class.h"
 
@@ -35,6 +36,96 @@
 uint64_t il2cpp_base = 0;
 static bool g_initialized = false;
 static bool g_DoLog = true;
+static std::string g_runtimeLibraryName;
+
+static bool moduleExportsIl2cppApi(const char *libraryName)
+{
+    if (!libraryName || !libraryName[0])
+        return false;
+
+    void *handle = xdl_open(libraryName, 0);
+    if (!handle)
+        return false;
+
+    void *sym = xdl_sym(handle, "il2cpp_domain_get", nullptr);
+    xdl_close(handle);
+    return sym != nullptr;
+}
+
+static std::string basenameFromMapsPath(const char *line)
+{
+    const char *path = std::strchr(line, '/');
+    if (!path)
+        return {};
+
+    const char *so = std::strstr(path, ".so");
+    if (!so)
+        return {};
+
+    std::string full(path, static_cast<size_t>(so - path) + 3);
+    const auto slash = full.find_last_of('/');
+    if (slash == std::string::npos)
+        return full;
+    return full.substr(slash + 1);
+}
+
+static std::vector<std::string> loadedAppLibraryNames()
+{
+    std::set<std::string> unique;
+    FILE *maps = std::fopen("/proc/self/maps", "r");
+    if (!maps)
+        return {};
+
+    char line[1024];
+    while (std::fgets(line, sizeof(line), maps))
+    {
+        if (!std::strstr(line, ".so"))
+            continue;
+        if (!std::strstr(line, "/data/app/") && !std::strstr(line, "/data/data/"))
+            continue;
+
+        std::string name = basenameFromMapsPath(line);
+        if (name.empty() || name == "libTool.so")
+            continue;
+        unique.insert(std::move(name));
+    }
+    std::fclose(maps);
+    return std::vector<std::string>(unique.begin(), unique.end());
+}
+
+static std::string detectRuntimeLibraryName()
+{
+    if (!g_runtimeLibraryName.empty())
+        return g_runtimeLibraryName;
+
+    const char *known[] = {
+        (const char *)targetLibName,
+        "libil2cpp.so",
+        "liblogic.so",
+        "libcsharp.so",
+        "libGameAssembly.so",
+    };
+
+    for (const char *name : known)
+    {
+        if (moduleExportsIl2cppApi(name))
+        {
+            g_runtimeLibraryName = name;
+            return g_runtimeLibraryName;
+        }
+    }
+
+    for (const auto &name : loadedAppLibraryNames())
+    {
+        if (moduleExportsIl2cppApi(name.c_str()))
+        {
+            g_runtimeLibraryName = name;
+            return g_runtimeLibraryName;
+        }
+    }
+
+    return {};
+}
 
 void init_il2cpp_api(void *handle){
 #define DO_API(r, n, p)                                                                                                \
@@ -494,13 +585,26 @@ static std::string GetPackageName() {
 
 namespace Il2cpp
 {
+    std::string GetRuntimeLibraryName()
+    {
+        return detectRuntimeLibraryName();
+    }
+
     void Init()
     {
-        auto handle = xdl_open(targetLibName, 0);
+        const std::string libName = detectRuntimeLibraryName();
+        if (libName.empty())
+        {
+            g_initialized = false;
+            LOGE("No loaded library exports il2cpp_domain_get");
+            return;
+        }
+
+        auto handle = xdl_open(libName.c_str(), 0);
         if (!handle)
         {
             g_initialized = false;
-            LOGE("Failed to open libil2cpp.so in this process");
+            LOGE("Failed to open %s in this process", libName.c_str());
             return;
         }
         init_il2cpp_api(handle);

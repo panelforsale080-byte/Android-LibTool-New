@@ -101,12 +101,21 @@ namespace
             return nullptr;
         }
 
-        waitForLibrary("libil2cpp.so", 180);
-        if (!isLibraryLoaded("libil2cpp.so"))
+        std::string runtimeLib;
+        for (int i = 0; i < 180; ++i)
         {
-            __android_log_print(ANDROID_LOG_ERROR, AGENT_LOG_TAG, "libil2cpp.so did not load");
+            runtimeLib = Il2cpp::GetRuntimeLibraryName();
+            if (!runtimeLib.empty())
+                break;
+            sleep(1);
+        }
+        if (runtimeLib.empty())
+        {
+            __android_log_print(ANDROID_LOG_ERROR, AGENT_LOG_TAG,
+                                "No IL2CPP runtime library found (libil2cpp/liblogic/libcsharp or any /data/app .so with classes)");
             return nullptr;
         }
+        __android_log_print(ANDROID_LOG_INFO, AGENT_LOG_TAG, "Using IL2CPP library: %s", runtimeLib.c_str());
 
         // Extra settle after the same point the original UI would start,
         // so Unity/IL2CPP domain and assemblies actually exist.

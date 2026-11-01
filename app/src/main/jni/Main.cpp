@@ -508,12 +508,12 @@ void ConfigInit()
 void on_init()
 {
     LOGD(__FUNCTION__);
-    while (!isLibraryLoaded(targetLibName))
+    while (Il2cpp::GetRuntimeLibraryName().empty())
     {
         sleep(1);
     }
 
-    LOGI("%s has been loaded", (const char *)targetLibName);
+    LOGI("%s has been loaded", Il2cpp::GetRuntimeLibraryName().c_str());
 
     Il2cpp::Init();
     Il2cpp::EnsureAttached();

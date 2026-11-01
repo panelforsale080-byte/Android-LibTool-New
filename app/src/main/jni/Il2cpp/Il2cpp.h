@@ -153,6 +153,7 @@ namespace Il2cpp
     std::string GetDumpPath();
     bool IsDumperReady();
     bool IsRuntimeReady();
+    std::string GetRuntimeLibraryName();
     
 } // namespace Il2cpp
 
